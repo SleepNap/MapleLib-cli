@@ -145,12 +145,34 @@ namespace MapleLib.XmlImgPatcher.Patcher
                 ?? throw new InvalidOperationException($"parent not found for {c.PathString}");
 
             string newName = c.Path[c.Path.Count - 1];
-            // Refuse to overwrite existing — surface as failure so caller can log it.
-            if (parent[newName] != null)
-                throw new InvalidOperationException($"already exists: {c.PathString}");
+            var existing = parent[newName];
 
-            WzImageProperty newProp = BuildProperty(c.SubTree, overrideName: newName);
-            parent.AddProperty(newProp);
+            if (existing == null)
+            {
+                // Simple ADD: node does not exist yet.
+                WzImageProperty newProp = BuildProperty(c.SubTree, overrideName: newName);
+                parent.AddProperty(newProp);
+                return;
+            }
+
+            // Upsert: node already exists. This happens when the diff rewrites a whole subtree
+            // (DELETE old children + ADD new children under the same name) — common for quest
+            // dialogue blocks. Only merge when both sides are containers; otherwise refuse so
+            // the caller logs it (leaf ADDs that collide are usually parser mis-attribution).
+            if (c.SubTree.Type == ValueType.Sub && existing is IPropertyContainer existingContainer)
+            {
+                existingContainer.ClearProperties();
+                WzImageProperty rebuilt = BuildProperty(c.SubTree, overrideName: newName);
+                if (rebuilt is IPropertyContainer rebuiltContainer)
+                {
+                    foreach (WzImageProperty child in rebuiltContainer.WzProperties)
+                        existingContainer.AddProperty(child.DeepClone());
+                }
+                img.Changed = true;
+                return;
+            }
+
+            throw new InvalidOperationException($"already exists: {c.PathString}");
         }
 
         public void ApplyDelete(WzImage img, Change c)

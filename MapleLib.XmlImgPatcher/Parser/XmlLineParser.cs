@@ -36,6 +36,22 @@ namespace MapleLib.XmlImgPatcher.Parser
             if (s.Length == 0) return null;
             if (s.StartsWith("<?")) return new ParsedLine { Kind = LineKind.XmlProlog };
             if (s.StartsWith("<!--")) return new ParsedLine { Kind = LineKind.Comment };
+
+            // Tolerate malformed diff lines that lost their leading '<' (observed in real server
+            // diffs, e.g. "-        string name=\"h1\" ..."). If the line starts with a known tag
+            // name followed by whitespace, prepend '<' so it parses. Only do this for lines that
+            // also contain name="..." to avoid false positives on prose.
+            if (!s.StartsWith("<") && !s.StartsWith("</"))
+            {
+                int sp = s.IndexOf(' ');
+                if (sp > 0)
+                {
+                    string maybeTag = s.Substring(0, sp);
+                    if (IsKnownTag(maybeTag) && s.Contains("name=\""))
+                        s = "<" + s;
+                }
+            }
+
             if (s.StartsWith("</"))
             {
                 // Closing tag
@@ -126,7 +142,41 @@ namespace MapleLib.XmlImgPatcher.Parser
         private static string DecodeXmlEntities(string s)
         {
             if (s.IndexOf('&') < 0) return s;
-            return s
+
+            // Handle numeric character references (&#xA; / &#10;) first, since the named-entity
+            // pass below would otherwise turn their leading '&' into '&amp;'. This matters for
+            // game text: servers store real newlines and serialise them as &#xA; in XML, so the
+            // diff's value attribute carries &#xA; which must decode back to '\n' before writing
+            // into the img — otherwise the img ends up holding the literal 5-char "&#xA;" string.
+            var sb = new System.Text.StringBuilder(s.Length);
+            int i = 0;
+            while (i < s.Length)
+            {
+                if (s[i] == '&')
+                {
+                    int semi = s.IndexOf(';', i + 1);
+                    if (semi > i && semi - i <= 8 && s[i + 1] == '#')
+                    {
+                        string body = s.Substring(i + 2, semi - i - 2);
+                        int code = -1;
+                        if (body.Length > 0 && (body[0] == 'x' || body[0] == 'X'))
+                            int.TryParse(body.Substring(1), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out code);
+                        else
+                            int.TryParse(body, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out code);
+                        if (code >= 0 && code <= 0x10FFFF)
+                        {
+                            sb.Append((char)code); // BMP only; sufficient for \n \r \t etc.
+                            i = semi + 1;
+                            continue;
+                        }
+                    }
+                }
+                sb.Append(s[i]);
+                i++;
+            }
+            string decoded = sb.ToString();
+
+            return decoded
                 .Replace("&lt;", "<")
                 .Replace("&gt;", ">")
                 .Replace("&quot;", "\"")
@@ -139,6 +189,29 @@ namespace MapleLib.XmlImgPatcher.Parser
         {
             if (string.IsNullOrEmpty(raw)) return 0;
             return int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) ? v : 0;
+        }
+
+        private static bool IsKnownTag(string tag)
+        {
+            switch (tag.ToLowerInvariant())
+            {
+                case "imgdir":
+                case "string":
+                case "int":
+                case "short":
+                case "long":
+                case "float":
+                case "double":
+                case "vector":
+                case "null":
+                case "canvas":
+                case "uol":
+                case "sound":
+                case "extended":
+                    return true;
+                default:
+                    return false;
+            }
         }
     }
 }

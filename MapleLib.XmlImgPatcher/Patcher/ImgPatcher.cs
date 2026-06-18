@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using MapleLib.WzLib;
 using MapleLib.XmlImgPatcher.Model;
 using ValueType = MapleLib.XmlImgPatcher.Model.ValueType;
@@ -44,7 +45,18 @@ namespace MapleLib.XmlImgPatcher.Patcher
             WzImage img = _adapter.LoadImg(inputImg);
             var result = new PatchResult();
 
-            foreach (var c in changes)
+            // Apply in a fixed phase order — Delete, then Modify, then Add — rather than the
+            // diff's textual order. git unified diffs interleave - and + runs at the sibling
+            // level, so an "ADD <imgdir X>" can textually precede "DELETE <imgdir X>" even
+            // though the DELETE must win (it speaks to the old tree, the ADD to the new one).
+            // Running deletes first makes the upsert-on-ADD path see a clean slot and avoids
+            // the "ADD then DELETE same node" race that wipes freshly-added subtrees.
+            var ordered = new List<Change>(changes.Count);
+            ordered.AddRange(changes.Where(c => c.Op == ChangeOp.Delete));
+            ordered.AddRange(changes.Where(c => c.Op == ChangeOp.Modify));
+            ordered.AddRange(changes.Where(c => c.Op == ChangeOp.Add));
+
+            foreach (var c in ordered)
             {
                 try
                 {

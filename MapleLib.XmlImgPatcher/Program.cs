@@ -2,8 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Xml.Linq;
 using MapleLib.WzLib;
 using MapleLib.WzLib.Serializer;
+using MapleLib.WzLib.WzProperties;
 using MapleLib.XmlImgPatcher.Parser;
 using MapleLib.XmlImgPatcher.Patcher;
 
@@ -72,7 +74,8 @@ namespace MapleLib.XmlImgPatcher
                 (positional[0] == "patch"
                  || positional[0] == "dump-xml"
                  || positional[0] == "batch"
-                 || positional[0] == "batch-dump-xml"))
+                 || positional[0] == "batch-dump-xml"
+                 || positional[0] == "verify"))
             {
                 mode = positional[0];
                 positional.RemoveAt(0);
@@ -83,6 +86,7 @@ namespace MapleLib.XmlImgPatcher
                 "dump-xml" => RunDumpXml(positional, version, verbose),
                 "batch" => RunBatch(positional, version, verbose, dryRun, strict, fullXmlDir),
                 "batch-dump-xml" => RunBatchDumpXml(positional, version, verbose),
+                "verify" => RunVerify(positional, version, verbose, fullXmlDir),
                 _ => RunPatch(positional, version, verbose, dryRun, strict, fullXml),
             };
         }
@@ -302,6 +306,163 @@ namespace MapleLib.XmlImgPatcher
             return stripped;
         }
 
+        // ---------- verify ----------
+        // verify <patched.img> <diff> [--full-xml=<path>]
+        // Loads the patched img directly and checks every "+" change (Add/Modify) against the
+        // node's runtime value. Bypasses dump-xml, so it tests the actual img contents — not
+        // the XML-serialisation quirks (e.g. how '\n' is written).
+        private static int RunVerify(List<string> positional, WzMapleVersion version, bool verbose, string? fullXmlDir)
+        {
+            if (positional.Count < 2 || positional.Count > 3)
+            {
+                Console.Error.WriteLine("usage: verify <patched.img> <diff> [--full-xml=<path> | <full-xml-dir>]");
+                return 2;
+            }
+            string imgPath = positional[0];
+            string diffPath = positional[1];
+            if (!File.Exists(imgPath)) { Console.Error.WriteLine($"img not found: {imgPath}"); return 2; }
+            if (!File.Exists(diffPath)) { Console.Error.WriteLine($"diff not found: {diffPath}"); return 2; }
+
+            // If a 3rd positional is a directory, derive the full-xml by mirroring the diff's
+            // relative path under that directory (so subdir structure is preserved).
+            string? fullXml = fullXmlDir;
+            if (positional.Count == 3)
+            {
+                string third = positional[2];
+                if (Directory.Exists(third))
+                {
+                    // Mirror the diff's path layout, stripping ".diff".
+                    string diffName = Path.GetFileName(diffPath);
+                    string xmlName = diffName.Substring(0, diffName.Length - ".diff".Length);
+                    // Walk up from the diff file to find a matching subdir under `third`.
+                    string? hit = FindMirroredXml(third, diffPath, xmlName);
+                    fullXml = hit;
+                }
+                else if (File.Exists(third))
+                {
+                    fullXml = third;
+                }
+            }
+
+            List<Model.Change> changes;
+            try
+            {
+                var parser = new DiffParser(fullXml);
+                changes = parser.ParseFile(diffPath);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"diff parse failed: {ex.Message}");
+                return 3;
+            }
+
+            var expected = changes.Where(c => c.Op == Model.ChangeOp.Add || c.Op == Model.ChangeOp.Modify).ToList();
+
+            try
+            {
+                var adapter = new MapleLibAdapter(version);
+                WzImage img = adapter.LoadImg(imgPath);
+
+                int match = 0, miss = 0;
+                foreach (var c in expected)
+                {
+                    var node = adapter.GetByPath(img, c.Path);
+                    if (node == null)
+                    {
+                        miss++;
+                        Console.Error.WriteLine($"[miss] {c.PathString} — node not found");
+                        continue;
+                    }
+                    bool ok = Matches(node, c);
+                    if (ok) { match++; if (verbose) Console.Out.WriteLine($"[ok ] {c.PathString}"); }
+                    else
+                    {
+                        miss++;
+                        Console.Error.WriteLine($"[miss] {c.PathString} — want={Short(c.Value)} got={Short(NodeValue(node))}");
+                    }
+                }
+                Console.Out.WriteLine($"verify: {expected.Count} expected, {match} match, {miss} miss");
+                return miss == 0 ? 0 : 1;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"verify failed: {ex.Message}");
+                if (verbose) Console.Error.WriteLine(ex);
+                return 1;
+            }
+        }
+
+        private static bool Matches(WzImageProperty node, Model.Change c)
+        {
+            switch (c.ValueType)
+            {
+                case Model.ValueType.String: return node is WzStringProperty s && (s.Value ?? "") == (c.Value ?? "");
+                case Model.ValueType.Int: return node is WzIntProperty i && i.Value == ParseInt(c.Value);
+                case Model.ValueType.Short: return node is WzShortProperty sh && sh.Value == (short)ParseInt(c.Value);
+                case Model.ValueType.Long: return node is WzLongProperty l && l.Value == ParseLong(c.Value);
+                case Model.ValueType.Float: return node is WzFloatProperty f && Math.Abs(f.Value - ParseFloat(c.Value)) < 1e-6f;
+                case Model.ValueType.Double: return node is WzDoubleProperty d && Math.Abs(d.Value - ParseDouble(c.Value)) < 1e-12;
+                case Model.ValueType.Vector: return node is WzVectorProperty v && v.X.Value == c.VectorX && v.Y.Value == c.VectorY;
+                case Model.ValueType.Null: return node is WzNullProperty;
+                case Model.ValueType.Sub: return node is WzSubProperty; // presence check
+                default: return false;
+            }
+        }
+
+        private static string NodeValue(WzImageProperty p) => p switch
+        {
+            WzStringProperty s => s.Value ?? "",
+            WzIntProperty i => i.Value.ToString(),
+            WzShortProperty sh => sh.Value.ToString(),
+            WzLongProperty l => l.Value.ToString(),
+            WzFloatProperty f => f.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            WzDoubleProperty d => d.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            WzVectorProperty v => $"({v.X.Value},{v.Y.Value})",
+            WzNullProperty => "<null>",
+            WzSubProperty => "<imgdir>",
+            _ => p.WzValue?.ToString() ?? "",
+        };
+
+        private static string Short(string? s) => s == null ? "<null>" : (s.Length > 50 ? s.Substring(0, 50) + "…" : s).Replace("\n", "\\n");
+
+        private static int ParseInt(string? s) => int.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int v) ? v : 0;
+        private static long ParseLong(string? s) => long.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out long v) ? v : 0L;
+        private static float ParseFloat(string? s) => float.TryParse(s, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float v) ? v : 0f;
+        private static double ParseDouble(string? s) => double.TryParse(s, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double v) ? v : 0d;
+
+        // Given a full-xml directory and a diff path, find the matching .xml by filename.
+        // Recurses the directory so subdirectory structure mismatches (e.g. server "Map.wz/Map/Map2/"
+        // vs a flatter layout) don't matter — only the leaf filename needs to match.
+        private static string? FindMirroredXml(string dir, string diffPath, string xmlName)
+        {
+            // xmlName is e.g. "209000000.img.xml". The full-xml file may sit anywhere under `dir`
+            // with that exact name.
+            var hits = Directory.GetFiles(dir, xmlName, SearchOption.AllDirectories);
+            if (hits.Length == 0) return null;
+            if (hits.Length == 1) return hits[0];
+            // Prefer the one whose relative path best matches the diff's relative path tail.
+            string diffTail = diffPath.Replace('/', '\\');
+            string best = hits[0];
+            int bestScore = -1;
+            foreach (var h in hits)
+            {
+                string rel = Path.GetRelativePath(dir, h);
+                int score = CommonSuffixSegments(rel, diffTail);
+                if (score > bestScore) { bestScore = score; best = h; }
+            }
+            return best;
+        }
+
+        private static int CommonSuffixSegments(string a, string b)
+        {
+            var aa = a.Replace('/', '\\').Split('\\');
+            var bb = b.Replace('/', '\\').Split('\\');
+            int i = aa.Length - 1, j = bb.Length - 1, n = 0;
+            while (i >= 0 && j >= 0 && string.Equals(aa[i], bb[j], StringComparison.OrdinalIgnoreCase))
+            { i--; j--; n++; }
+            return n;
+        }
+
         // ---------- batch-dump-xml ----------
         private static int RunBatchDumpXml(List<string> positional, WzMapleVersion version, bool verbose)
         {
@@ -340,6 +501,7 @@ namespace MapleLib.XmlImgPatcher
             w.WriteLine("  xml-img-patcher dump-xml       <input.img> <output.xml>        [选项]");
             w.WriteLine("  xml-img-patcher batch          <img目录> <diff目录> <输出目录> [选项]");
             w.WriteLine("  xml-img-patcher batch-dump-xml <img目录> <xml输出目录>         [选项]");
+            w.WriteLine("  xml-img-patcher verify         <patched.img> <diff> [full-xml或目录] [选项]");
             w.WriteLine();
             w.WriteLine("子命令说明：");
             w.WriteLine("  patch           对一个 .img 文件应用一个 .diff，输出新 .img。");
@@ -352,6 +514,10 @@ namespace MapleLib.XmlImgPatcher
             w.WriteLine("                  diff 目录可以多层嵌套，工具会递归扫所有 *.diff。");
             w.WriteLine("                  没找到对应 img 的 diff 会跳过并在最后汇总。");
             w.WriteLine("  batch-dump-xml  批量版的 dump-xml。递归把目录下所有 .img 都转成 .xml。");
+            w.WriteLine("  verify          校验：直接加载 patch 后的 .img，把 diff 里每条 + 变更");
+            w.WriteLine("                  和 img 节点的真实值逐条比对。绕过 dump-xml，所以测的是");
+            w.WriteLine("                  img 内部内容本身，不受 XML 序列化影响。");
+            w.WriteLine("                  第 3 个参数可给单个完整 XML 文件或目录（自动配对）。");
             w.WriteLine();
             w.WriteLine("通用选项：");
             w.WriteLine("  -h, --help             显示这个帮助。");
