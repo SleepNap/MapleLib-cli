@@ -399,3 +399,9 @@ FodyWeavers.xsd
 
 # Claude Code
 .claude
+
+# xml-img-patcher: local build artifacts and test workspaces
+dist/
+work_*/
+xml-img-patcher-plan.md
+*_20260618.sh
