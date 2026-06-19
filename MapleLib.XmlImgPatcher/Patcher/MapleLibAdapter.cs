@@ -155,10 +155,13 @@ namespace MapleLib.XmlImgPatcher.Patcher
                 return;
             }
 
-            // Upsert: node already exists. This happens when the diff rewrites a whole subtree
-            // (DELETE old children + ADD new children under the same name) — common for quest
-            // dialogue blocks. Only merge when both sides are containers; otherwise refuse so
-            // the caller logs it (leaf ADDs that collide are usually parser mis-attribution).
+            // Upsert: node already exists. Two real cases hit this:
+            //  (a) diff rewrites a whole subtree (DELETE old children + ADD new children under
+            //      the same imgdir) — common for quest dialogue blocks.
+            //  (b) diff `+`-only adds a leaf (or imgdir) that the client already has from a
+            //      prior translation pass; here `diff is truth` means we should overwrite.
+            // Either way: treat ADD-on-existing as replace-in-place. Drop the old node and
+            // insert the rebuilt one under the same parent.
             if (c.SubTree.Type == ValueType.Sub && existing is IPropertyContainer existingContainer)
             {
                 existingContainer.ClearProperties();
@@ -172,20 +175,27 @@ namespace MapleLib.XmlImgPatcher.Patcher
                 return;
             }
 
-            throw new InvalidOperationException($"already exists: {c.PathString}");
+            // Leaf-on-leaf (or any other shape mismatch): remove the existing property and
+            // add the diff's version. Same idempotent semantics as MODIFY.
+            parent.RemoveProperty(existing);
+            WzImageProperty replacement = BuildProperty(c.SubTree, overrideName: newName);
+            parent.AddProperty(replacement);
+            img.Changed = true;
         }
 
         public void ApplyDelete(WzImage img, Change c)
         {
-            var parent = GetParent(img, c.Path)
-                ?? throw new InvalidOperationException($"parent not found for {c.PathString}");
+            // Idempotent: if the parent itself is already gone (an earlier DELETE killed an
+            // ancestor, or the client img never had this branch), nothing left to remove.
+            // git diffs that remove a whole subtree emit one DELETE per leaf in the subtree, so
+            // by the time we hit "QuestInfo.img/8034/name" the parent "8034" was already deleted
+            // by the change for "QuestInfo.img/8034". Treat both shapes the same: the post-state
+            // matches what the diff asks for.
+            var parent = GetParent(img, c.Path);
+            if (parent == null) return;
             string targetName = c.Path[c.Path.Count - 1];
             var existing = parent[targetName];
-            if (existing == null)
-            {
-                // already gone — treat as no-op (idempotent delete)
-                return;
-            }
+            if (existing == null) return;
             parent.RemoveProperty(existing);
         }
 
