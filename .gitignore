@@ -405,3 +405,6 @@ dist/
 work_*/
 xml-img-patcher-plan.md
 *_20260618.sh
+
+# Local test-runs (xml-img-patcher fixtures, do not commit)
+test-runs/
