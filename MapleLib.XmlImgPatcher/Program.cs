@@ -44,19 +44,38 @@ namespace MapleLib.XmlImgPatcher
             foreach (string a in args)
             {
                 if (a == "-h" || a == "--help") { PrintHelp(Console.Out); return 0; }
+                else if (a == "-V" || a == "--version") { Console.Out.WriteLine("xml-img-patcher 0.1.0"); return 0; }
                 else if (a == "-v" || a == "--verbose") verbose = true;
                 else if (a == "--dry-run") dryRun = true;
                 else if (a == "--strict") strict = true;
                 else if (a.StartsWith("--full-xml=", StringComparison.Ordinal))
+                {
                     fullXml = a.Substring("--full-xml=".Length);
+                    if (!string.IsNullOrEmpty(fullXml) && !File.Exists(fullXml))
+                        Console.Error.WriteLine($"[warn] --full-xml 文件不存在: {fullXml}，将不使用路径回退");
+                }
                 else if (a.StartsWith("--full-xml-dir=", StringComparison.Ordinal))
+                {
                     fullXmlDir = a.Substring("--full-xml-dir=".Length);
+                    if (!string.IsNullOrEmpty(fullXmlDir) && !Directory.Exists(fullXmlDir))
+                        Console.Error.WriteLine($"[warn] --full-xml-dir 目录不存在: {fullXmlDir}，将不使用路径回退");
+                }
+                else if (a.StartsWith("--iv=", StringComparison.Ordinal))
+                {
+                    string v = a.Substring("--iv=".Length);
+                    if (!TryParseIv(v, out version))
+                    {
+                        Console.Error.WriteLine($"unknown --iv: {v}（可用值: gms / ems / bms / cms / classic）");
+                        return 2;
+                    }
+                }
                 else if (a.StartsWith("--version=", StringComparison.Ordinal))
                 {
+                    Console.Error.WriteLine("[warn] --version=<KEY> 已弃用，请改用 --iv=<KEY>");
                     string v = a.Substring("--version=".Length);
-                    if (!Enum.TryParse(v, ignoreCase: true, out version))
+                    if (!TryParseIv(v, out version))
                     {
-                        Console.Error.WriteLine($"unknown --version: {v}");
+                        Console.Error.WriteLine($"unknown --version: {v}（可用值: GMS / EMS / BMS / CLASSIC）");
                         return 2;
                     }
                 }
@@ -70,16 +89,21 @@ namespace MapleLib.XmlImgPatcher
 
             // Decide subcommand. Default: `patch` (3 positionals, backwards-compat).
             string mode = "patch";
-            if (positional.Count > 0 &&
-                (positional[0] == "patch"
-                 || positional[0] == "dump-xml"
-                 || positional[0] == "batch"
-                 || positional[0] == "batch-dump-xml"
-                 || positional[0] == "verify"
-                 || positional[0] == "dump-changes"))
+            var knownCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { "patch", "dump-xml", "batch", "batch-dump-xml", "verify", "dump-changes" };
+            if (positional.Count > 0 && knownCommands.Contains(positional[0]))
             {
                 mode = positional[0];
                 positional.RemoveAt(0);
+            }
+            else if (positional.Count > 0 && !knownCommands.Contains(positional[0]) && positional.Count != 3)
+            {
+                // positional[0] could be a subcommand the user typed wrong, or a file path.
+                // If it's 3 positionals they probably typed "patch" implicitly (backwards-compat).
+                // If it's 1 positional it's probably a misspelled subcommand.
+                Console.Error.WriteLine($"unknown command: {positional[0]}");
+                PrintHelp(Console.Error);
+                return 2;
             }
 
             return mode switch
@@ -609,6 +633,27 @@ namespace MapleLib.XmlImgPatcher
         }
 
         // ---------- help ----------
+        private static bool TryParseIv(string s, out WzMapleVersion version)
+        {
+            // Accept GMS / EMS / BMS / CLASSIC (MapleLib's canonical names), plus
+            // a couple of common aliases. Case-insensitive.
+            switch ((s ?? "").Trim().ToUpperInvariant())
+            {
+                case "GMS":     version = WzMapleVersion.GMS; return true;
+                case "EMS":     version = WzMapleVersion.EMS; return true;
+                case "BMS":
+                case "CMS":     // CMS is conventionally encoded with the BMS IV
+                    version = WzMapleVersion.BMS; return true;
+                case "CLASSIC":
+                case "LATEST":  // Java side calls it "latest"; map to CLASSIC for parity
+                    version = WzMapleVersion.CLASSIC; return true;
+                case "GENERATE": version = WzMapleVersion.GENERATE; return true;
+                default:
+                    version = WzMapleVersion.GMS;
+                    return false;
+            }
+        }
+
         private static void PrintHelp(TextWriter w)
         {
             w.WriteLine("xml-img-patcher  -  把服务端 *.img.xml 的 git diff 应用到客户端 *.img");
@@ -638,8 +683,11 @@ namespace MapleLib.XmlImgPatcher
             w.WriteLine();
             w.WriteLine("通用选项：");
             w.WriteLine("  -h, --help             显示这个帮助。");
+            w.WriteLine("  -V, --version          打印版本号并退出。");
             w.WriteLine("  -v, --verbose          失败时打印完整堆栈，方便排查。");
-            w.WriteLine("      --version=<KEY>    WZ 加密 IV：GMS / EMS / BMS / CLASSIC，默认 GMS。");
+            w.WriteLine("      --iv=<KEY>         WZ 加密 IV，大小写不敏感。默认 gms。");
+            w.WriteLine("                         可用：gms / ems / bms / cms / classic / latest");
+            w.WriteLine("                         （--version=<KEY> 是已弃用的别名，将来会移除）");
             w.WriteLine();
             w.WriteLine("patch / batch 专用选项：");
             w.WriteLine("      --dry-run          只解析+模拟应用，不写文件。用来先看看哪些会失败、");
