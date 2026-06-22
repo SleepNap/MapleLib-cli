@@ -152,6 +152,26 @@ namespace MapleLib.XmlImgPatcher
                 return 3;
             }
 
+            // Empty / non-diff detection. A legitimate diff always has `@@` hunk headers;
+            // a file with zero hunks is either an empty diff (no changes) or not a diff at
+            // all. Distinguish: if the file contains any diff marker (`diff --git`, `--- `,
+            // `+++ `, `@@`) treat it as a legitimately empty diff and warn; if none, treat
+            // it as "not a diff file" and exit 3 per README.
+            if (changes.Count == 0)
+            {
+                bool looksLikeDiff = File.ReadLines(diffPath).Any(l =>
+                    l.StartsWith("diff --git", StringComparison.Ordinal)
+                    || l.StartsWith("@@", StringComparison.Ordinal)
+                    || l.StartsWith("--- ", StringComparison.Ordinal)
+                    || l.StartsWith("+++ ", StringComparison.Ordinal));
+                if (!looksLikeDiff)
+                {
+                    Console.Error.WriteLine($"diff parse failed: {diffPath} 不是 unified diff 文件（未找到 diff/hunk 头）");
+                    return 3;
+                }
+                Console.Error.WriteLine($"[warn] {diffPath} 解析到 0 条变更（可能是空 diff），仍继续写出 img");
+            }
+
             try
             {
                 var adapter = new MapleLibAdapter(version);
@@ -412,6 +432,22 @@ namespace MapleLib.XmlImgPatcher
             {
                 Console.Error.WriteLine($"diff parse failed: {ex.Message}");
                 return 3;
+            }
+
+            // Empty / non-diff detection (same logic as patch).
+            if (changes.Count == 0)
+            {
+                bool looksLikeDiff = File.ReadLines(diffPath).Any(l =>
+                    l.StartsWith("diff --git", StringComparison.Ordinal)
+                    || l.StartsWith("@@", StringComparison.Ordinal)
+                    || l.StartsWith("--- ", StringComparison.Ordinal)
+                    || l.StartsWith("+++ ", StringComparison.Ordinal));
+                if (!looksLikeDiff)
+                {
+                    Console.Error.WriteLine($"diff parse failed: {diffPath} 不是 unified diff 文件（未找到 diff/hunk 头）");
+                    return 3;
+                }
+                Console.Error.WriteLine($"[warn] {diffPath} 解析到 0 条变更（可能是空 diff）");
             }
 
             // Add/Modify changes must be present with the expected value.
