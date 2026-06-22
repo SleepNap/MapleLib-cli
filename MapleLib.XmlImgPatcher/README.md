@@ -12,6 +12,7 @@ xml-img-patcher dump-xml       <input.img>  <output.xml>                [选项]
 xml-img-patcher batch          <img目录>    <diff目录>   <输出目录>      [选项]
 xml-img-patcher batch-dump-xml <img目录>    <xml输出目录>                [选项]
 xml-img-patcher verify         <patched.img> <diff>      [full-xml或目录][选项]
+xml-img-patcher dump-changes   <diff>       [full-xml或目录]             [选项]
 ```
 
 | 子命令 | 作用 |
@@ -21,14 +22,17 @@ xml-img-patcher verify         <patched.img> <diff>      [full-xml或目录][选
 | `batch` | 批量 patch。`a/b/Foo.img.xml.diff` 自动配对 `<img目录>/a/b/Foo.img`（自动剥 `.wz` 段：`String.wz/Mob.img.xml.diff` ⇄ `String/Mob.img`）。递归扫整个 diff 目录 |
 | `batch-dump-xml` | 批量 dump-xml。递归把目录下所有 `.img` 转成 `.xml` |
 | `verify` | 直接加载 patched .img，逐个把 diff 里 `+` 变更跟节点的运行时值比对。绕开 dump-xml，测的是 .img 内部内容本身，最权威 |
+| `dump-changes` | 调试用：打印 DiffParser 解析 diff 后得到的所有 Change（op / path / value / 源行号），不写文件 |
 
 ## 选项
 
 | 选项 | 适用 | 含义 |
 |---|---|---|
 | `-h`, `--help` | 全部 | 显示帮助 |
+| `-V`, `--version` | 全部 | 打印版本号并退出 |
 | `-v`, `--verbose` | 全部 | 失败时打印完整堆栈 |
-| `--version=<KEY>` | 全部 | WZ 加密 IV，可选 `GMS` / `EMS` / `BMS` / `CLASSIC`，默认 `GMS` |
+| `--iv=<KEY>` | 全部 | WZ 加密 IV，大小写不敏感。可选 `gms` / `ems` / `bms` / `cms` / `classic` / `latest`，默认 `gms`。`cms`/`latest` 分别等价于 `bms`/`classic` |
+| `--version=<KEY>` | 全部 | **已弃用**，等价于 `--iv=<KEY>`，将来会移除 |
 | `--dry-run` | `patch`, `batch` | 加载 + 模拟应用，不写文件 |
 | `--strict` | `patch`, `batch` | 任意一条变更失败立即中止（默认尽力跑完后汇总） |
 | `--full-xml=<文件>` | `patch` | 服务端 patch 后的完整 XML。给短 hunk 提供上下文（深嵌套小改动靠这个才能定位到节点路径）。强烈建议常加 |
@@ -203,3 +207,5 @@ py test-runs\normalize2.py <dumped.xml> <canon.xml>
 - 不解析 diff 文件头里的路径，仅看 hunk 内容。多文件 diff 应当拆开传入
 - `--strict` 失败时不会回滚已应用的修改；但 `--dry-run` 不会写文件，可用于先校验
 - 短 hunk（深嵌套小改动）必须配 `--full-xml` / `--full-xml-dir` 才能正确推路径——hunk 上下文不含外层 `<imgdir>` 时光看 diff 推不出
+- `--full-xml` / `--full-xml-dir` 路径不存在时会输出 `[warn]` 但不中止（仍按无 full-xml 的方式跑）
+- `dump-xml` 输出风格（缩进 2 空格、`<x/>` 自闭合、`<null>` 标签写法）跟服务端 XML 不完全一致，文本级 diff 会有假阳性。需要严格比较时用 `verify` 子命令
