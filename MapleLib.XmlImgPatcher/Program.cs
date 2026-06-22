@@ -75,7 +75,8 @@ namespace MapleLib.XmlImgPatcher
                  || positional[0] == "dump-xml"
                  || positional[0] == "batch"
                  || positional[0] == "batch-dump-xml"
-                 || positional[0] == "verify"))
+                 || positional[0] == "verify"
+                 || positional[0] == "dump-changes"))
             {
                 mode = positional[0];
                 positional.RemoveAt(0);
@@ -87,6 +88,7 @@ namespace MapleLib.XmlImgPatcher
                 "batch" => RunBatch(positional, version, verbose, dryRun, strict, fullXmlDir),
                 "batch-dump-xml" => RunBatchDumpXml(positional, version, verbose),
                 "verify" => RunVerify(positional, version, verbose, fullXmlDir),
+                "dump-changes" => RunDumpChanges(positional, fullXml),
                 _ => RunPatch(positional, version, verbose, dryRun, strict, fullXml),
             };
         }
@@ -306,6 +308,38 @@ namespace MapleLib.XmlImgPatcher
             return stripped;
         }
 
+        // ---------- dump-changes ----------
+        // dump-changes <diff> [--full-xml=<path>]
+        // Debug helper: print every Change the DiffParser produces, one per line.
+        private static int RunDumpChanges(List<string> positional, string? fullXml)
+        {
+            if (positional.Count < 1)
+            {
+                Console.Error.WriteLine("usage: dump-changes <diff> [--full-xml=<path>]");
+                return 2;
+            }
+            string diffPath = positional[0];
+            if (!File.Exists(diffPath)) { Console.Error.WriteLine($"diff not found: {diffPath}"); return 2; }
+            try
+            {
+                var parser = new DiffParser(fullXml);
+                var changes = parser.ParseFile(diffPath);
+                foreach (var c in changes)
+                {
+                    string val = c.Value == null ? "<null>" : c.Value.Replace("\n", "\\n");
+                    if (val.Length > 80) val = val.Substring(0, 80) + "…";
+                    Console.Out.WriteLine($"{c.Op,-6} {c.PathString} :: {c.ValueType} = {val}  (line {c.SourceLine})");
+                }
+                Console.Out.WriteLine($"total: {changes.Count} changes");
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"dump-changes failed: {ex.Message}");
+                return 3;
+            }
+        }
+
         // ---------- verify ----------
         // verify <patched.img> <diff> [--full-xml=<path>]
         // Loads the patched img directly and checks every "+" change (Add/Modify) against the
@@ -356,7 +390,53 @@ namespace MapleLib.XmlImgPatcher
                 return 3;
             }
 
-            var expected = changes.Where(c => c.Op == Model.ChangeOp.Add || c.Op == Model.ChangeOp.Modify).ToList();
+            // Add/Modify changes must be present with the expected value.
+            // Delete changes must be absent (patcher must have removed them).
+            // Two cases where a "Delete" entry must be ignored:
+            //   (1) Same path is also Added in the same diff (rename / re-insert at same name).
+            //       The Add wins — node should be present.
+            //   (2) An ancestor path is being Added as a Sub container. The diff often "removes the
+            //       old container and all its leaves" then "adds a new container with new leaves".
+            //       The leaf-level Deletes inside that container are redundant: rebuilding the
+            //       container under the same name reseeds its contents. Don't validate them.
+            // Flatten ADD SubTree entries into individual leaf-level expectations so
+            // verify can check every node, not just the container's presence.
+            var expected = new List<Model.Change>();
+            foreach (var c in changes.Where(c => c.Op == Model.ChangeOp.Add || c.Op == Model.ChangeOp.Modify))
+            {
+                if (c.Op == Model.ChangeOp.Add && c.ValueType == Model.ValueType.Sub && c.SubTree != null)
+                {
+                    // c.Path already ends with SubTree.Name, so pass the parent of c.Path
+                    // (drop last segment) as the prefix when recursing.
+                    var parentPath = c.Path.Count > 0
+                        ? new List<string>(c.Path.Take(c.Path.Count - 1))
+                        : new List<string>();
+                    FlattenSubTree(parentPath, c.SubTree, c.SourceLine, expected);
+                }
+                else
+                    expected.Add(c);
+            }
+            var addPaths = new HashSet<string>(expected.Select(c => c.PathString));
+            var addContainerPaths = new HashSet<string>(
+                expected.Where(c => c.ValueType == Model.ValueType.Sub).Select(c => c.PathString));
+
+            bool HasAddAncestor(string path)
+            {
+                int slash = path.LastIndexOf('/');
+                while (slash > 0)
+                {
+                    string parent = path.Substring(0, slash);
+                    if (addContainerPaths.Contains(parent)) return true;
+                    slash = parent.LastIndexOf('/');
+                }
+                return false;
+            }
+
+            var deletes = changes
+                .Where(c => c.Op == Model.ChangeOp.Delete
+                            && !addPaths.Contains(c.PathString)
+                            && !HasAddAncestor(c.PathString))
+                .ToList();
 
             try
             {
@@ -381,14 +461,51 @@ namespace MapleLib.XmlImgPatcher
                         Console.Error.WriteLine($"[miss] {c.PathString} — want={Short(c.Value)} got={Short(NodeValue(node))}");
                     }
                 }
-                Console.Out.WriteLine($"verify: {expected.Count} expected, {match} match, {miss} miss");
-                return miss == 0 ? 0 : 1;
+
+                // Verify DELETE: each deleted path must be absent from the patched img.
+                int delOk = 0, delMiss = 0;
+                foreach (var c in deletes)
+                {
+                    var node = adapter.GetByPath(img, c.Path);
+                    if (node == null)
+                    {
+                        delOk++;
+                        if (verbose) Console.Out.WriteLine($"[ok ] DELETE {c.PathString}");
+                    }
+                    else
+                    {
+                        delMiss++;
+                        Console.Error.WriteLine($"[miss] DELETE {c.PathString} — still present, value={Short(NodeValue(node))}");
+                    }
+                }
+
+                Console.Out.WriteLine(
+                    $"verify: {expected.Count} expected, {match} match, {miss} miss; " +
+                    $"deletes: {deletes.Count} expected absent, {delOk} ok, {delMiss} still present");
+                return (miss == 0 && delMiss == 0) ? 0 : 1;
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"verify failed: {ex.Message}");
                 if (verbose) Console.Error.WriteLine(ex);
                 return 1;
+            }
+        }
+
+        private static void FlattenSubTree(List<string> parentPath, Model.SubTree node, int sourceLine, List<Model.Change> outList)
+        {
+            var path = new List<string>(parentPath) { node.Name };
+            if (node.Type == Model.ValueType.Sub)
+            {
+                // Always emit the container presence check, then recurse children.
+                // SubTree node itself is the container with children.
+                outList.Add(new Model.Change(path, Model.ChangeOp.Add, Model.ValueType.Sub, null, sourceLine, node, node.VectorX, node.VectorY));
+                foreach (var child in node.Children)
+                    FlattenSubTree(path, child, sourceLine, outList);
+            }
+            else
+            {
+                outList.Add(new Model.Change(path, Model.ChangeOp.Add, node.Type, node.Value, sourceLine, null, node.VectorX, node.VectorY));
             }
         }
 

@@ -212,8 +212,15 @@ namespace MapleLib.XmlImgPatcher.Parser
 
         // Walk a list of '+' lines starting at idx. For top-level adds, emit Change(ADD).
         // Returns the (consumed) idx.
-        private int HandlePlusEntries(List<(string body, int sourceLine)> entries, ref int idx, Stack<string> newStack, List<Change> output)
+        private int HandlePlusEntries(List<(string body, int sourceLine)> entries, ref int idx, Stack<string> outerStack, List<Change> output)
         {
+            // Clone the outer (context) stack. Track plus-block nesting with the clone.
+            // After the plus block, any containers that were pushed but not popped by the
+            // plus block's own entries are pushed back onto the outer stack — they will be
+            // closed by subsequent context lines.
+            var stack = new Stack<string>(new Stack<string>(outerStack));
+            int initialDepth = stack.Count;
+
             while (idx < entries.Count)
             {
                 var entry = entries[idx];
@@ -226,8 +233,7 @@ namespace MapleLib.XmlImgPatcher.Parser
 
                 if (pl.Kind == XmlLineParser.LineKind.ImgDirClose)
                 {
-                    // Ascending — pop new stack and stop processing siblings here.
-                    if (newStack.Count > 0) newStack.Pop();
+                    if (stack.Count > 1) stack.Pop();
                     idx++;
                     return idx;
                 }
@@ -235,7 +241,7 @@ namespace MapleLib.XmlImgPatcher.Parser
                 if (pl.Kind == XmlLineParser.LineKind.LeafSelfClosing
                     || pl.Kind == XmlLineParser.LineKind.ImgDirSelfClosing)
                 {
-                    var path = StackToPath(newStack);
+                    var path = StackToPath(stack);
                     path.Add(pl.Name);
                     var subTree = BuildLeafSubTree(pl);
                     output.Add(new Change(path, ChangeOp.Add, subTree.Type, subTree.Value, entry.sourceLine, subTree, subTree.VectorX, subTree.VectorY));
@@ -245,12 +251,11 @@ namespace MapleLib.XmlImgPatcher.Parser
 
                 if (pl.Kind == XmlLineParser.LineKind.ImgDirOpen)
                 {
-                    // Build full subtree by consuming subsequent + entries until matching close.
-                    var path = StackToPath(newStack);
-                    path.Add(pl.Name);
+                    stack.Push(pl.Name);
+                    var path = StackToPath(stack);
                     var sub = new SubTree(pl.Name, ValueType.Sub, null);
                     int childIdx = idx + 1;
-                    BuildSubTreeFrom(entries, ref childIdx, sub);
+                    BuildSubTreeFrom(entries, ref childIdx, sub, stack);
                     output.Add(new Change(path, ChangeOp.Add, ValueType.Sub, null, entry.sourceLine, sub));
                     idx = childIdx;
                     continue;
@@ -258,12 +263,27 @@ namespace MapleLib.XmlImgPatcher.Parser
 
                 idx++;
             }
+
+            // If the plus block pushed containers that were not closed (because the
+            // closing </imgdir> is on a context line), preserve them on the outer stack
+            // so subsequent context lines can pop them correctly.
+            if (stack.Count > initialDepth)
+            {
+                // Transfer the extra depth to the outer stack.
+                var extras = new List<string>();
+                while (stack.Count > initialDepth)
+                    extras.Add(stack.Pop());
+                extras.Reverse();
+                foreach (var name in extras)
+                    outerStack.Push(name);
+            }
+
             return idx;
         }
 
         // After encountering an ImgDirOpen, recursively build the SubTree by consuming entries
         // until the matching </imgdir>. Mutates idx.
-        private void BuildSubTreeFrom(List<(string body, int sourceLine)> entries, ref int idx, SubTree parent)
+        private void BuildSubTreeFrom(List<(string body, int sourceLine)> entries, ref int idx, SubTree parent, Stack<string> newStack)
         {
             while (idx < entries.Count)
             {
@@ -276,6 +296,8 @@ namespace MapleLib.XmlImgPatcher.Parser
                 }
                 if (pl.Kind == XmlLineParser.LineKind.ImgDirClose)
                 {
+                    // Pop the container name that was pushed by the matching ImgDirOpen.
+                    if (newStack.Count > 1) newStack.Pop();
                     idx++;
                     return;
                 }
@@ -288,9 +310,10 @@ namespace MapleLib.XmlImgPatcher.Parser
                 }
                 if (pl.Kind == XmlLineParser.LineKind.ImgDirOpen)
                 {
+                    newStack.Push(pl.Name);
                     var sub = new SubTree(pl.Name, ValueType.Sub, null);
                     idx++;
-                    BuildSubTreeFrom(entries, ref idx, sub);
+                    BuildSubTreeFrom(entries, ref idx, sub, newStack);
                     parent.Children.Add(sub);
                     continue;
                 }
@@ -354,7 +377,11 @@ namespace MapleLib.XmlImgPatcher.Parser
             }
             else if (pl.Kind == XmlLineParser.LineKind.ImgDirClose)
             {
-                if (stack.Count > 0) stack.Pop();
+                // Never pop the root imgdir name (e.g. "Say.img"). In long hunks
+                // the context lines may close everything down to the image root,
+                // but Add/Modify/Delete paths must always include the root name
+                // for consistency with other hunks and with the seed stack.
+                if (stack.Count > 1) stack.Pop();
             }
         }
 
