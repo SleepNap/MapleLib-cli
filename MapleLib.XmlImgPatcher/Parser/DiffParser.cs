@@ -214,13 +214,8 @@ namespace MapleLib.XmlImgPatcher.Parser
         // Returns the (consumed) idx.
         private int HandlePlusEntries(List<(string body, int sourceLine)> entries, ref int idx, Stack<string> outerStack, List<Change> output)
         {
-            // Clone the outer (context) stack. Track plus-block nesting with the clone.
-            // After the plus block, any containers that were pushed but not popped by the
-            // plus block's own entries are pushed back onto the outer stack — they will be
-            // closed by subsequent context lines.
-            var stack = new Stack<string>(new Stack<string>(outerStack));
-            int initialDepth = stack.Count;
-
+            // Track changes to outerStack directly: open pushes, close pops, BuildSubTreeFrom
+            // handles its own nesting and returns any still-open nested names which we push.
             while (idx < entries.Count)
             {
                 var entry = entries[idx];
@@ -233,15 +228,15 @@ namespace MapleLib.XmlImgPatcher.Parser
 
                 if (pl.Kind == XmlLineParser.LineKind.ImgDirClose)
                 {
-                    if (stack.Count > 1) stack.Pop();
+                    if (outerStack.Count > 1) outerStack.Pop();
                     idx++;
-                    return idx;
+                    continue;
                 }
 
                 if (pl.Kind == XmlLineParser.LineKind.LeafSelfClosing
                     || pl.Kind == XmlLineParser.LineKind.ImgDirSelfClosing)
                 {
-                    var path = StackToPath(stack);
+                    var path = StackToPath(outerStack);
                     path.Add(pl.Name);
                     var subTree = BuildLeafSubTree(pl);
                     output.Add(new Change(path, ChangeOp.Add, subTree.Type, subTree.Value, entry.sourceLine, subTree, subTree.VectorX, subTree.VectorY));
@@ -251,40 +246,45 @@ namespace MapleLib.XmlImgPatcher.Parser
 
                 if (pl.Kind == XmlLineParser.LineKind.ImgDirOpen)
                 {
-                    stack.Push(pl.Name);
-                    var path = StackToPath(stack);
+                    outerStack.Push(pl.Name);
+                    var path = StackToPath(outerStack);
                     var sub = new SubTree(pl.Name, ValueType.Sub, null);
                     int childIdx = idx + 1;
-                    BuildSubTreeFrom(entries, ref childIdx, sub, stack);
+                    List<string>? unclosedNested = BuildSubTreeFrom(entries, ref childIdx, sub);
                     output.Add(new Change(path, ChangeOp.Add, ValueType.Sub, null, entry.sourceLine, sub));
                     idx = childIdx;
+                    if (unclosedNested == null)
+                    {
+                        // BuildSubTreeFrom consumed the matching </imgdir>; the container is closed.
+                        outerStack.Pop();
+                    }
+                    else
+                    {
+                        // Container (and possibly nested containers inside it) still open.
+                        // Push the nested names so subsequent context lines pop them correctly.
+                        foreach (var name in unclosedNested) outerStack.Push(name);
+                    }
                     continue;
                 }
 
                 idx++;
             }
 
-            // If the plus block pushed containers that were not closed (because the
-            // closing </imgdir> is on a context line), preserve them on the outer stack
-            // so subsequent context lines can pop them correctly.
-            if (stack.Count > initialDepth)
-            {
-                // Transfer the extra depth to the outer stack.
-                var extras = new List<string>();
-                while (stack.Count > initialDepth)
-                    extras.Add(stack.Pop());
-                extras.Reverse();
-                foreach (var name in extras)
-                    outerStack.Push(name);
-            }
-
             return idx;
         }
 
         // After encountering an ImgDirOpen, recursively build the SubTree by consuming entries
-        // until the matching </imgdir>. Mutates idx.
-        private void BuildSubTreeFrom(List<(string body, int sourceLine)> entries, ref int idx, SubTree parent, Stack<string> newStack)
+        // until the matching </imgdir>. Returns the names of any STILL-OPEN nested containers
+        // (innermost-last) when the matching close is NOT found within the plus block —
+        // these were opened inside this container but their close is on a later context line,
+        // so they must be transferred to the outer stack so context can pop them.
+        // Returns null if the matching close was found (subtree fully closed).
+        //
+        // Does NOT touch the shared stack — uses a local list of pending opens.
+        private List<string>? BuildSubTreeFrom(List<(string body, int sourceLine)> entries, ref int idx, SubTree parent)
         {
+            // Stack of nested-open SubTrees we're currently building inside. Last item is innermost.
+            var openStack = new List<SubTree> { parent };
             while (idx < entries.Count)
             {
                 var entry = entries[idx];
@@ -296,29 +296,34 @@ namespace MapleLib.XmlImgPatcher.Parser
                 }
                 if (pl.Kind == XmlLineParser.LineKind.ImgDirClose)
                 {
-                    // Pop the container name that was pushed by the matching ImgDirOpen.
-                    if (newStack.Count > 1) newStack.Pop();
+                    openStack.RemoveAt(openStack.Count - 1);
                     idx++;
-                    return;
+                    if (openStack.Count == 0) return null; // matching close for `parent`
+                    continue;
                 }
                 if (pl.Kind == XmlLineParser.LineKind.LeafSelfClosing
                     || pl.Kind == XmlLineParser.LineKind.ImgDirSelfClosing)
                 {
-                    parent.Children.Add(BuildLeafSubTree(pl));
+                    openStack[openStack.Count - 1].Children.Add(BuildLeafSubTree(pl));
                     idx++;
                     continue;
                 }
                 if (pl.Kind == XmlLineParser.LineKind.ImgDirOpen)
                 {
-                    newStack.Push(pl.Name);
                     var sub = new SubTree(pl.Name, ValueType.Sub, null);
+                    openStack[openStack.Count - 1].Children.Add(sub);
+                    openStack.Add(sub);
                     idx++;
-                    BuildSubTreeFrom(entries, ref idx, sub, newStack);
-                    parent.Children.Add(sub);
                     continue;
                 }
                 idx++;
             }
+            // Entries exhausted before parent was closed. Return names of still-open
+            // nested containers (excluding `parent` itself), innermost-first.
+            // Caller knows `parent` itself is also unclosed.
+            var unclosed = new List<string>();
+            for (int i = 1; i < openStack.Count; i++) unclosed.Add(openStack[i].Name);
+            return unclosed;
         }
 
         private static SubTree BuildLeafSubTree(XmlLineParser.ParsedLine pl)
