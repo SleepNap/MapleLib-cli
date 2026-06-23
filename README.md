@@ -1,272 +1,218 @@
-# MapleLib (.NET core 10.0)
+# xml-img-patcher
 
-MapleStory File and Protocol Toolkit: A library for parsing, modifying, and creating MapleStory client files and server communication protocols.
-A general-purpose MapleStory library, adapted for [Harepacker-resurrected](https://github.com/lastbattle/Harepacker-resurrected).
+把服务端 XML 的 git unified diff 应用到客户端 `.img` 文件，**保留所有未触及的 PNG / Sound / Canvas / UOL / Vector 等二进制资源**。
 
-https://github.com/hadeutscher/MapleLib
+适用场景：服务端用瘦 XML（只含业务节点）维护文本/数值变更，客户端的 `.img` 里有完整图标/音效/UI 资源；要把服务端的改动同步回客户端，又不能丢资源。
 
- - MapleLib2 by haha01haha01; 
- - based on MapleLib by Snow; 
- - based on WzLib by JonyLeeson; 
- - based on information from Fiel\Koolk.
+## 为什么需要这个工具
 
-## Overview
+直接的"反向重生成 .img"流程会把客户端那些只存在于 .img、不存在于服务端 XML 的资源（PNG 图标、音效、UOL 引用、Vector 几何…）全部丢掉——之前出过 `0403.img: 1.3 MB → 70 KB`、`Skill/000.img: 3.1 MB → 4.9 KB` 这种事故。
 
-MapleLib is a .NET library designed to work with MapleStory's file formats and network protocols. It provides tools for reading, editing, and writing game assets stored in proprietary formats, as well as handling client-server packet structures. This library powers projects like HaRepacker-resurrected [HaCreator and HaRepacker] for GUI-based editing.
+本工具走另一条路：**直接打开 .img、按 diff 改节点、原样写回**，不重建文件。Diff 没碰到的节点一字节不动。
 
-## Features
+## 用法
 
-- Support for parsing and modifying .wz archive files, which contain game data like maps, items, and UI elements.
-- Handling of compressed data streams.
-- Encrypting and decrypting (.ms)
-- Packet reading and writing for MapleStory's network communication.
-- Compatibility with various MapleStory versions through version-specific handling. (beta v1 -> v260 ++)
-- Integration with external tools for advanced editing, such as map creation and asset extraction.
-- Support for loading hotfix files like Data.wz and raw .img files.
-- Handling of list files (List.wz) for pre-Big Bang versions.
+### 子命令
 
-## Installation
-
-1. Clone the repository:
-   ```
-   git clone https://github.com/lastbattle/MapleLib.git
-   ```
-2. Open the solution in Visual Studio or use the .NET CLI.
-3. Restore NuGet packages and build the project targeting .NET 8.0 or compatible framework.
-
-No NuGet package is currently available; build from source for use in your projects.
-
-## Usage
-
-MapleLib provides classes under namespaces like `MapleLib.WzLib` for file handling. Below are examples for common operations.
-
-### WzFileManager
-
-For managing multiple .wz files, especially in a MapleStory directory context, use `WzFileManager`.
-
-```csharp
-using MapleLib.WzLib;
-
-// Initialize WzFileManager with base directory
-string baseDirectory = @"C:\Nexon\MapleStory"; // Example path
-bool isStandalone = false; // Set to true if loading single file without directory structure
-WzFileManager manager = new WzFileManager(baseDirectory, isStandalone);
-manager.BuildWzFileList(); // Scans and builds list of available .wz files
+```
+xml-img-patcher patch          <input.img> <diff> <output.img> [选项]
+xml-img-patcher dump-xml       <input.img> <output.xml>        [选项]
+xml-img-patcher batch          <img目录> <diff目录> <输出目录> [选项]
+xml-img-patcher batch-dump-xml <img目录> <xml输出目录>         [选项]
+xml-img-patcher verify         <patched.img> <diff> [full-xml或目录] [选项]
+xml-img-patcher export         --from=<hash或datetime>        [选项]
+xml-img-patcher dump-changes   <diff>       [full-xml或目录]  [选项]
 ```
 
-### Opening .wz Files
+| 子命令 | 作用 |
+|---|---|
+| `patch` | 对一个 .img 应用一个 .diff，输出新 .img。保留 PNG/Sound/UOL 等所有 diff 没碰过的二进制资源 |
+| `dump-xml` | 把 .img 转成服务端格式的 .xml，方便肉眼看或对比 |
+| `batch` | 批量版的 patch。按文件名自动配对：diff 目录下 `a/b/Foo.img.xml.diff` → 找 img 目录里的 `a/b/Foo.img` → 写到输出目录 `a/b/Foo.img`。diff 目录可多层嵌套，工具会递归扫所有 `*.diff`。没找到对应 img 的 diff 会跳过并在最后 BATCH SUMMARY 汇总 |
+| `batch-dump-xml` | 批量版的 dump-xml。递归把目录下所有 .img 都转成 .xml |
+| `verify` | 校验：直接加载 patch 后的 .img，把 diff 里每条 + 变更（Add/Modify）查节点比对值；DELETE 查节点是否已消失。绕过 dump-xml 序列化，测的就是 img 的实际内容 |
+| `export` | 从 git 仓库导出指定起点之后的 wz xml 与 diff。`--from` 同时支持 commit hash 和 datetime |
+| `dump-changes` | 调试用：打印 DiffParser 解析 diff 后得到的所有 Change（op / path / value / 源行号），不写文件 |
 
-.wz files are the primary archives in MapleStory. You can load them directly or via `WzFileManager`.
+### patch 选项
 
-Using direct `WzFile`:
+| 选项 | 说明 |
+|---|---|
+| `-v, --verbose` | 失败时打印完整堆栈 |
+| `--dry-run` | 解析 diff、加载 img、模拟 patch，**不写文件** |
+| `--strict` | 任何一条 change 失败立即中止；默认是尽力做完，最后汇总 |
+| `--iv <GMS\|EMS\|BMS\|CLASSIC>` | WZ 加密 IV，默认 `GMS`（大小写不敏感） |
+| `--full-xml <file>` | 完整服务端 XML（diff `+++` 那一侧的最终文件）。当 hunk 上下文不带外层 imgdir 时，用它从 hunk 头的行号反查路径栈，避免歧义/找不到节点。**强烈推荐配** |
+| `--full-xml-dir <dir>` | 完整服务端 XML 根目录，会按 diff 路径自动配对。批量处理时用这个，比 `--full-xml` 省事 |
 
-```csharp
-using MapleLib.WzLib;
-using System;
+### batch 选项
 
-string filePath = "Base.wz"; // Path to your .wz file
-WzMapleVersion version = WzMapleVersion.BMS; // Adjust based on region/version, e.g., BMS, GMS, EMS, CUSTOM
+| 选项 | 说明 |
+|---|---|
+| `--full-xml-dir <dir>` | 完整服务端 XML 根目录（按 diff 路径自动配对） |
+| `--dry-run` / `--strict` / `--iv` / `-v` | 同 patch |
 
-WzFile wzFile = new WzFile(filePath, version);
-try
-{
-    wzFile.ParseWzFile();
-    // Access the root directory
-    WzDirectory root = wzFile.WzDirectory;
-    // Example: Get a child directory and image
-    WzDirectory folder = root.GetDirectory("SomeFolder");
-    WzImage image = folder.GetImage("SomeImage.img");
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"Error loading .wz file: {ex.Message}");
-}
-finally
-{
-    wzFile.Dispose(); // Always dispose to free resources
-}
+### dump-xml / batch-dump-xml 选项
+
+| 选项 | 说明 |
+|---|---|
+| `--iv <GMS\|EMS\|BMS\|CLASSIC>` | 同上 |
+| `--linux` | 用 LF 行尾（默认 CRLF） |
+
+默认会**跳过 PNG / Sound 等二进制资源**（只输出节点骨架），便于纯文本对比。
+
+### verify 选项
+
+| 选项 | 说明 |
+|---|---|
+| `<full-xml 或目录>` | 第 3 个位置参数。完整服务端 XML 文件，或与之同布局的目录（工具会按 diff 文件名配对查找）。用来恢复 hunk 路径栈 |
+| `--iv <GMS\|EMS\|BMS\|CLASSIC>` | 同上 |
+| `-v` | 打印每条 ok / miss |
+
+### export 选项
+
+| 选项 | 说明 |
+|---|---|
+| `--from <hash或datetime>` | 起点（必填）。commit hash 或 datetime 两种形态 |
+| `--repo <dir>` | git 仓库根目录（默认当前目录） |
+| `--out-xml <dir>` | xml 输出根（默认 ~/Desktop/upgrade_yyyyMMdd） |
+| `--out-diff <dir>` | diff 输出根（默认 ~/Desktop/diff_yyyyMMdd） |
+| `--prefix <pref>` | 扫描目录前缀（可多个，默认 gms-server/wz、gms-server/wz-zh-CN） |
+| `--no-diff` | 只复制 xml，不生成 diff |
+| `--context <N>` | git diff 上下文行数 -U（默认 30） |
+
+## 退出码
+
+| 码 | 含义 |
+|---|---|
+| 0 | 全部成功 |
+| 1 | 部分 change 失败但已写出（非严格模式） |
+| 2 | 参数错误或文件不存在 |
+| 3 | diff 解析失败 |
+| 4 | img 解析失败 |
+| 5 | img 写入失败 |
+
+## 输出格式
+
+可被 AI / shell 脚本解析，关键字 `MODIFY` / `ADD` / `DELETE` / `[ok]` / `[err]` 永远是英文：
+
+```
+[parse] 12 changes from diff
+[ok]  MODIFY  Mob.img/9999999/name = "已杀怪物数"
+[ok]  ADD     0403.img/04031786 (subtree, 2 nodes)
+[err] MODIFY  Foo/Bar — node not found
+3 applied, 1 failed. Output: D:\out.img (1,335,712 bytes)
 ```
 
-Using `WzFileManager`:
+`batch` 末尾额外有 `BATCH SUMMARY`，列出 ok/fail/skip 计数和失败/跳过的文件清单。
 
-```csharp
-// Assuming manager is initialized as above
-string filePath = "Map.wz";
-WzMapleVersion version = WzMapleVersion.BMS;
-WzFile f = manager.LoadWzFile(filePath, version);
-if (f != null)
-{
-    // Use f as above
-    // Optionally load related files, e.g., for Map.wz, load Map001.wz etc. if applicable
-    string[] relatedFiles = Directory.GetFiles(Path.GetDirectoryName(filePath), "Map*.wz");
-    foreach (string related in relatedFiles)
-    {
-        if (related != filePath)
-            manager.LoadWzFile(related, version);
-    }
-}
+## 典型用法
+
+### 单文件 patch
+
+```bash
+xml-img-patcher patch \
+  --full-xml=C:/upgrade_20260622/wz-zh-CN/Quest.wz/QuestInfo.img.xml \
+  C:/client/Data/Quest/QuestInfo.img \
+  C:/diff_20260622/wz-zh-CN/Quest.wz/QuestInfo.img.xml.diff \
+  C:/out/Quest/QuestInfo.img
 ```
 
-For versions requiring key brute-forcing (WzMapleVersion.GENERATE), implement a key finder or use tools like HaRepacker's brute-force form.
+### 先 dry-run 看会不会失败，再实跑
 
-### Opening .ms Files
-
-.ms file is an encrypted layer wrapping .wz file, implemented after version 220+ of MapleStory. Load them using `WzMsFile` and convert to `WzFile`.
-
-```csharp
-using MapleLib.WzLib.MSFile;
-using System.IO;
-
-string filePath = "Map.ms"; // Path to your .ms file
-using (FileStream fileStream = File.OpenRead(filePath))
-{
-    MemoryStream memoryStream = new MemoryStream();
-    fileStream.CopyTo(memoryStream);
-    memoryStream.Position = 0;
-
-    string msFileName = Path.GetFileName(filePath);
-    WzMsFile msFile = new WzMsFile(memoryStream, msFileName, filePath, true);
-    msFile.ReadEntries();
-
-    WzFile wzFile = msFile.LoadAsWzFile();
-
-    // Now use wzFile as a standard WzFile
-    // Optionally load into manager
-    // WzFileManager.LoadWzFile(msFileName, wzFile);
-}
+```bash
+xml-img-patcher patch --dry-run --full-xml="..." input.img diff output.img   # 不写文件
+# 确认 0 failed 后去掉 --dry-run 实跑
 ```
 
-### Opening Other Files
+### 批量 patch 整个 diff 目录
 
-#### Raw .img Files or Data.wz hotfixes file
-
-```csharp
-string filePath = "Patch.img"; // or Data.wz hotfix
-WzMapleVersion version = WzMapleVersion.BMS;
-
-WzImage img = manager.LoadDataWzHotfixFile(filePath, version);
-if (img != null)
-{
-    // Parse and use the image
-    img.ParseImage();
-}
+```bash
+xml-img-patcher batch \
+  --full-xml-dir=C:/upgrade_20260622/wz-zh-CN \
+  C:/client/Data \
+  C:/diff_20260622/wz-zh-CN \
+  C:/out/Data
 ```
 
-#### List.wz Files (Pre-Big Bang)
+末尾会打印 `BATCH SUMMARY`，汇总 ok / fail / skip 文件数和每个失败/跳过的原因。
 
-If `WzTool.IsListFile(filePath)`, open with a specialized editor (e.g., ListEditor in HaRepacker).
+### 校验 patched img 是否正确
 
-## Additional Examples
-
-### Traversing WzDirectories
-
-After loading a WzFile, you can iterate through its directories and images to access or cache content.
-
-```csharp
-// Assuming wzFile is loaded, e.g., from NPC.wz
-// npcWzDirs could be a list of WzDirectory instances, such as from multiple loaded files or subdirectories
-List<WzDirectory> npcWzDirs = new List<WzDirectory> { wzFile.WzDirectory }; // Example: single root directory
-
-foreach (WzDirectory npcWzDir in npcWzDirs)
-{
-    foreach (WzImage npcImage in npcWzDir.WzImages)
-    {
-        string npcId = npcImage.Name.Replace(".img", "");
-    }
-}
+```bash
+xml-img-patcher verify \
+  C:/out/Quest/QuestInfo.img \
+  C:/diff_20260622/wz-zh-CN/Quest.wz/QuestInfo.img.xml.diff \
+  C:/upgrade_20260622/wz-zh-CN
 ```
 
-For nested directories, recursively traverse `npcWzDir.WzDirectories`.
+输出 `verify: N expected, N match, 0 miss` 即通过。
 
-### Working with WzImage
+### 把 .img 导出成 XML 肉眼看
 
-Once you have a WzImage (e.g., from a WzDirectory), parse it to access its properties.
-
-```csharp
-// Assuming image is obtained, e.g., WzImage image = ...;
-image.ParseImage(); // Parse the image if not already parsed to load properties
-
-// Access properties by name (top-level)
-WzImageProperty prop = image["propertyName"]; // Using indexer, if available, or via list
-
-// Or iterate through all properties
-foreach (WzImageProperty subProp in image.WzProperties)
-{
-    string propName = subProp.Name;
-    // Check type and handle accordingly, e.g., if (subProp is WzStringProperty) { string value = ((WzStringProperty)subProp).Value; }
-}
-
-// Access nested properties using path
-WzImageProperty nestedProp = image.GetFromPath("folder/subfolder/property"); // Using GetFromPath method
-
-// Example: Extracting a canvas property for minimap
-WzCanvasProperty minimap = (WzCanvasProperty)image.GetFromPath("miniMap/canvas");
-if (minimap != null)
-{
-    Bitmap minimapBitmap = minimap.GetLinkedWzCanvasBitmap();
-    // Use the bitmap, e.g., display in a PictureBox or save
-    minimapBitmap.Save("minimap.png", ImageFormat.Png);
-}
-else
-{
-    // Fallback, e.g., empty bitmap
-    Bitmap empty = new Bitmap(1, 1);
-}
+```bash
+xml-img-patcher dump-xml "E:/Client/EN/String/Mob.img" "C:/out/Mob.xml" --linux
 ```
 
-Note: Ensure the image is parsed before accessing properties. Paths in GetFromPath use '/' as separator for nested structures.
+### 从服务端 git 仓库导出 xml + diff
 
-### Extracting Assets from .wz
+```bash
+# 按 commit hash
+xml-img-patcher export --from=27529d68 --repo="E:/LocalGit/GitHub/BeiDou-Server"
 
-```csharp
-// Continuing from loaded WzFile and image
-WzCanvasProperty canvasProp = (WzCanvasProperty)image.GetFromPath("miniMap/canvas"); // Example path to a canvas property
-if (canvasProp != null)
-{
-    Bitmap bitmap = canvasProp.GetLinkedWzCanvasBitmap();
-    bitmap.Save("extracted.png", ImageFormat.Png);
-}
+# 按时间点（找该时刻前最近一次 commit 作为起点）
+xml-img-patcher export --from="2026-06-22 14:00" --repo="E:/LocalGit/GitHub/BeiDou-Server"
 ```
 
-### Packet Handling for Protocols
+### 一站式工作流：从服务端拉 → 打到客户端 → 验
 
-MapleLib also supports network packets.
+```bash
+# Step 1: 从服务端 git 仓库导出补丁数据
+xml-img-patcher export --from=27529d68 \
+  --repo="E:/LocalGit/GitHub/BeiDou-Server" \
+  --out-xml=C:/upgrade --out-diff=C:/diff
 
-```csharp
-using MapleLib.PacketLib;
+# Step 2a: wz 层（英文层）应用到客户端 EN 目录
+xml-img-patcher batch --full-xml-dir=C:/upgrade/wz \
+  E:/Client/EN C:/diff/wz C:/out/EN
 
-PacketReader reader = new PacketReader(receivedBytes); // From network stream
-short opcode = reader.ReadShort();
-string message = reader.ReadMapleString();
-// Process based on opcode
+# Step 2b: wz-zh-CN 层应用到客户端 Data 目录
+xml-img-patcher batch --full-xml-dir=C:/upgrade/wz-zh-CN \
+  E:/Client/Data C:/diff/wz-zh-CN C:/out/Data
+
+# Step 3: 校验
+xml-img-patcher verify C:/out/Data/Quest/Say.img \
+  C:/diff/wz-zh-CN/Quest.wz/Say.img.xml.diff \
+  C:/upgrade/wz-zh-CN
 ```
 
-For writing packets:
+**关键映射规则**（patch/batch 共用）：
+- 服务端 `wz/` 层 → 客户端 `EN/`（英文文本）目录（若不存在则回退到 `Data/`）
+- 服务端 `wz-zh-CN/` 层 → 客户端 `Data/`（中文汉化）目录
+- diff 路径 `String.wz/Mob.img.xml.diff` 自动剥 `.wz` 段 → img 路径 `String/Mob.img`
 
-```csharp
-PacketWriter writer = new PacketWriter();
-writer.WriteShort(0x01); // Opcode
-writer.WriteMapleString("Hello Maple");
-// Send writer.ToArray() over network
+## 构建
+
+要求 .NET 10.0+：
+
+```bash
+dotnet build MapleLib.XmlImgPatcher/MapleLib.XmlImgPatcher.csproj -c Release
 ```
 
-## Dependencies
- - .NET 10.0 runtime
- - [spine-runtime 2.1.25 (ported to .net 7.0)](https://github.com/EsotericSoftware/spine-runtimes)
- - [lz4net 1.0.15.93+](https://github.com/MiloszKrajewski/lz4net)
- - [MonoGame.Framework.DesktopGL 3.8.2.1105+](https://www.nuget.org/packages/MonoGame.Framework.DesktopGL)
- - [NAudio 2.2.0+](https://www.nuget.org/packages/NAudio)
- - [Newtonsoft.Json](https://www.nuget.org/packages/Newtonsoft.Json/)
- - [SharpDX 4.2.0](https://www.nuget.org/packages/SharpDX)
+发布为 self-contained 单文件 exe（csproj 已默认 PublishSingleFile + win-x64）：
 
-## Contributing
+```bash
+dotnet publish MapleLib.XmlImgPatcher/MapleLib.XmlImgPatcher.csproj -c Release
+# 产物在 bin/Release/net10.0-windows/win-x64/publish/xml-img-patcher.exe
+```
 
-Contributions are welcome! Fork the repository, make changes, and submit a pull request. 
+项目根 `publish.bat` 是封装好的一键构建，产出复制到 `dist/xml-img-patcher.exe`。
 
-Older pre Big-Bang version of MapleStory will always be the priority, with some focus on improving compatibility with newer MapleStory versions or adding features for unsupported file types.
+## 姊妹仓库
 
-## License
+| 实现 | 仓库 | 产物 |
+|---|---|---|
+| C# | <https://github.com/SleepNap/MapleLib-cli> | `dist/xml-img-patcher.exe`（.NET AOT/publish 单文件） |
+| Java | <https://github.com/SleepNap/orange-wz-cli> | `dist/xml-img-patcher.exe`（GraalVM native，standalone） |
 
-MIT License - See LICENSE file for details.
-[https://raw.githubusercontent.com/lastbattle/MapleLib/main/LICENSE](License)
-
+两边功能、子命令、选项、退出码、输出格式**完全一致**，脚本可互换。两边 `dump-xml --linux` 输出逐字节一致。

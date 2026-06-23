@@ -1,223 +1,212 @@
-# MapleLib.XmlImgPatcher
+# xml-img-patcher
 
-CLI 工具：把服务端 `*.img.xml` 的 git unified diff 应用到客户端 `*.img` 二进制文件，**保留所有未被 diff 触及的二进制资源**（PNG / Sound / UOL / Vector 等）。
+把服务端 XML 的 git unified diff 应用到客户端 `.img` 文件，**保留所有未触及的 PNG / Sound / Canvas / UOL / Vector 等二进制资源**。
 
-典型用法是中文化场景——服务端 `wz/*.xml` 是英文，客户端 `*.img` 是中文，patch 完出来就是英文客户端；或者反过来用 `wz-zh-CN/*.xml` 把英文客户端汉化。
+适用场景：服务端用瘦 XML（只含业务节点）维护文本/数值变更，客户端的 `.img` 里有完整图标/音效/UI 资源；要把服务端的改动同步回客户端，又不能丢资源。
 
-## 子命令
+## 为什么需要这个工具
+
+直接的"反向重生成 .img"流程会把客户端那些只存在于 .img、不存在于服务端 XML 的资源（PNG 图标、音效、UOL 引用、Vector 几何…）全部丢掉——之前出过 `0403.img: 1.3 MB → 70 KB`、`Skill/000.img: 3.1 MB → 4.9 KB` 这种事故。
+
+本工具走另一条路：**直接打开 .img、按 diff 改节点、原样写回**，不重建文件。Diff 没碰到的节点一字节不动。
+
+## 用法
+
+### 子命令
 
 ```
-xml-img-patcher patch          <input.img>  <diff>       <output.img>   [选项]
-xml-img-patcher dump-xml       <input.img>  <output.xml>                [选项]
-xml-img-patcher batch          <img目录>    <diff目录>   <输出目录>      [选项]
-xml-img-patcher batch-dump-xml <img目录>    <xml输出目录>                [选项]
-xml-img-patcher verify         <patched.img> <diff>      [full-xml或目录][选项]
-xml-img-patcher export         --from=<hash或datetime>                  [选项]
-xml-img-patcher dump-changes   <diff>       [full-xml或目录]             [选项]
+xml-img-patcher patch          <input.img> <diff> <output.img> [选项]
+xml-img-patcher dump-xml       <input.img> <output.xml>        [选项]
+xml-img-patcher batch          <img目录> <diff目录> <输出目录> [选项]
+xml-img-patcher batch-dump-xml <img目录> <xml输出目录>         [选项]
+xml-img-patcher verify         <patched.img> <diff> [full-xml或目录] [选项]
+xml-img-patcher export         --from=<hash或datetime>        [选项]
+xml-img-patcher dump-changes   <diff>       [full-xml或目录]  [选项]
 ```
 
 | 子命令 | 作用 |
 |---|---|
-| `patch` | 单文件应用 diff，输出新 .img。保留 PNG/音效/UOL 等所有 diff 没碰过的资源 |
-| `dump-xml` | 把 .img 转成服务端格式的 .xml，方便对比或肉眼查看 |
-| `batch` | 批量 patch。`a/b/Foo.img.xml.diff` 自动配对 `<img目录>/a/b/Foo.img`（自动剥 `.wz` 段）。递归扫整个 diff 目录 |
-| `batch-dump-xml` | 批量 dump-xml。递归把目录下所有 `.img` 转成 `.xml` |
-| `verify` | 直接加载 patched .img，逐个把 diff 里 `+` 变更跟节点的运行时值比对。最权威 |
-| `export` | 从 git 仓库导出服务端补丁 xml + diff。`--from` 支持 commit hash 或 datetime |
-| `dump-changes` | 调试用：打印 DiffParser 解析 diff 后得到的所有 Change |
+| `patch` | 对一个 .img 应用一个 .diff，输出新 .img。保留 PNG/Sound/UOL 等所有 diff 没碰过的二进制资源 |
+| `dump-xml` | 把 .img 转成服务端格式的 .xml，方便肉眼看或对比 |
+| `batch` | 批量版的 patch。按文件名自动配对：diff 目录下 `a/b/Foo.img.xml.diff` → 找 img 目录里的 `a/b/Foo.img` → 写到输出目录 `a/b/Foo.img`。diff 目录可多层嵌套，工具会递归扫所有 `*.diff`。没找到对应 img 的 diff 会跳过并在最后 BATCH SUMMARY 汇总 |
+| `batch-dump-xml` | 批量版的 dump-xml。递归把目录下所有 .img 都转成 .xml |
+| `verify` | 校验：直接加载 patch 后的 .img，把 diff 里每条 + 变更（Add/Modify）查节点比对值；DELETE 查节点是否已消失。绕过 dump-xml 序列化，测的就是 img 的实际内容 |
+| `export` | 从 git 仓库导出指定起点之后的 wz xml 与 diff。`--from` 同时支持 commit hash 和 datetime |
+| `dump-changes` | 调试用：打印 DiffParser 解析 diff 后得到的所有 Change（op / path / value / 源行号），不写文件 |
 
-## 选项
+### patch 选项
 
-| 选项 | 适用 | 含义 |
-|---|---|---|
-| `-h`, `--help` | 全部 | 显示帮助 |
-| `-V`, `--version` | 全部 | 打印版本号并退出 |
-| `-v`, `--verbose` | 全部 | 失败时打印完整堆栈 |
-| `--iv=<KEY>` | 全部 | WZ 加密 IV，大小写不敏感。可选 `gms` / `ems` / `bms` / `cms` / `classic` / `latest`，默认 `gms`。`cms`/`latest` 分别等价于 `bms`/`classic` |
-| `--version=<KEY>` | 全部 | **已弃用**，等价于 `--iv=<KEY>`，将来会移除 |
-| `--dry-run` | `patch`, `batch` | 加载 + 模拟应用，不写文件 |
-| `--strict` | `patch`, `batch` | 任意一条变更失败立即中止（默认尽力跑完后汇总） |
-| `--full-xml=<文件>` | `patch` | 服务端 patch 后的完整 XML。给短 hunk 提供上下文（深嵌套小改动靠这个才能定位到节点路径）。强烈建议常加 |
-| `--full-xml-dir=<目录>` | `patch`, `batch` | 跟 `--full-xml` 同样作用，按目录结构自动配对 |
-| `--from=<hash或datetime>` | `export` | 起点（必填） |
-| `--repo=<dir>` | `export` | git 仓库根（默认当前目录） |
-| `--out-xml=<dir>` | `export` | xml 输出根（默认 ~/Desktop/upgrade_yyyyMMdd） |
-| `--out-diff=<dir>` | `export` | diff 输出根（默认 ~/Desktop/diff_yyyyMMdd） |
-| `--prefix=<pref>` | `export` | 扫描目录前缀（可多个，默认 gms-server/wz,wz-zh-CN） |
-| `--no-diff` | `export` | 只复制 xml，不生成 diff |
-| `--context=<N>` | `export` | git diff 上下文行数 -U（默认 30） |
+| 选项 | 说明 |
+|---|---|
+| `-v, --verbose` | 失败时打印完整堆栈 |
+| `--dry-run` | 解析 diff、加载 img、模拟 patch，**不写文件** |
+| `--strict` | 任何一条 change 失败立即中止；默认是尽力做完，最后汇总 |
+| `--iv <GMS\|EMS\|BMS\|CLASSIC>` | WZ 加密 IV，默认 `GMS`（大小写不敏感） |
+| `--full-xml <file>` | 完整服务端 XML（diff `+++` 那一侧的最终文件）。当 hunk 上下文不带外层 imgdir 时，用它从 hunk 头的行号反查路径栈，避免歧义/找不到节点。**强烈推荐配** |
+| `--full-xml-dir <dir>` | 完整服务端 XML 根目录，会按 diff 路径自动配对。批量处理时用这个，比 `--full-xml` 省事 |
+
+### batch 选项
+
+| 选项 | 说明 |
+|---|---|
+| `--full-xml-dir <dir>` | 完整服务端 XML 根目录（按 diff 路径自动配对） |
+| `--dry-run` / `--strict` / `--iv` / `-v` | 同 patch |
+
+### dump-xml / batch-dump-xml 选项
+
+| 选项 | 说明 |
+|---|---|
+| `--iv <GMS\|EMS\|BMS\|CLASSIC>` | 同上 |
+| `--linux` | 用 LF 行尾（默认 CRLF） |
+
+默认会**跳过 PNG / Sound 等二进制资源**（只输出节点骨架），便于纯文本对比。
+
+### verify 选项
+
+| 选项 | 说明 |
+|---|---|
+| `<full-xml 或目录>` | 第 3 个位置参数。完整服务端 XML 文件，或与之同布局的目录（工具会按 diff 文件名配对查找）。用来恢复 hunk 路径栈 |
+| `--iv <GMS\|EMS\|BMS\|CLASSIC>` | 同上 |
+| `-v` | 打印每条 ok / miss |
+
+### export 选项
+
+| 选项 | 说明 |
+|---|---|
+| `--from <hash或datetime>` | 起点（必填）。commit hash 或 datetime 两种形态 |
+| `--repo <dir>` | git 仓库根目录（默认当前目录） |
+| `--out-xml <dir>` | xml 输出根（默认 ~/Desktop/upgrade_yyyyMMdd） |
+| `--out-diff <dir>` | diff 输出根（默认 ~/Desktop/diff_yyyyMMdd） |
+| `--prefix <pref>` | 扫描目录前缀（可多个，默认 gms-server/wz、gms-server/wz-zh-CN） |
+| `--no-diff` | 只复制 xml，不生成 diff |
+| `--context <N>` | git diff 上下文行数 -U（默认 30） |
 
 ## 退出码
 
 | 码 | 含义 |
 |---|---|
 | 0 | 全部成功 |
-| 1 | 部分变更失败但 .img 已写出（非 strict 模式下的"尽力跑完"） |
-| 2 | 参数错误或文件/目录不存在 |
+| 1 | 部分 change 失败但已写出（非严格模式） |
+| 2 | 参数错误或文件不存在 |
 | 3 | diff 解析失败 |
 | 4 | img 解析失败 |
 | 5 | img 写入失败 |
 
-## 输出格式（可被 AI / 脚本解析）
+## 输出格式
+
+可被 AI / shell 脚本解析，关键字 `MODIFY` / `ADD` / `DELETE` / `[ok]` / `[err]` 永远是英文：
 
 ```
 [parse] 12 changes from diff
-[ok]  MODIFY  Mob/9999999/name = "已杀怪物数"
-[ok]  ADD     0403/04031786 (subtree, 2 nodes)
+[ok]  MODIFY  Mob.img/9999999/name = "已杀怪物数"
+[ok]  ADD     0403.img/04031786 (subtree, 2 nodes)
 [err] MODIFY  Foo/Bar — node not found
 3 applied, 1 failed. Output: D:\out.img (1,335,712 bytes)
 ```
 
-`batch` 末尾会再打印一份 `BATCH SUMMARY`，列出失败/跳过的文件清单。
+`batch` 末尾额外有 `BATCH SUMMARY`，列出 ok/fail/skip 计数和失败/跳过的文件清单。
+
+## 典型用法
+
+### 单文件 patch
+
+```bash
+xml-img-patcher patch \
+  --full-xml=C:/upgrade_20260622/wz-zh-CN/Quest.wz/QuestInfo.img.xml \
+  C:/client/Data/Quest/QuestInfo.img \
+  C:/diff_20260622/wz-zh-CN/Quest.wz/QuestInfo.img.xml.diff \
+  C:/out/Quest/QuestInfo.img
+```
+
+### 先 dry-run 看会不会失败，再实跑
+
+```bash
+xml-img-patcher patch --dry-run --full-xml="..." input.img diff output.img   # 不写文件
+# 确认 0 failed 后去掉 --dry-run 实跑
+```
+
+### 批量 patch 整个 diff 目录
+
+```bash
+xml-img-patcher batch \
+  --full-xml-dir=C:/upgrade_20260622/wz-zh-CN \
+  C:/client/Data \
+  C:/diff_20260622/wz-zh-CN \
+  C:/out/Data
+```
+
+末尾会打印 `BATCH SUMMARY`，汇总 ok / fail / skip 文件数和每个失败/跳过的原因。
+
+### 校验 patched img 是否正确
+
+```bash
+xml-img-patcher verify \
+  C:/out/Quest/QuestInfo.img \
+  C:/diff_20260622/wz-zh-CN/Quest.wz/QuestInfo.img.xml.diff \
+  C:/upgrade_20260622/wz-zh-CN
+```
+
+输出 `verify: N expected, N match, 0 miss` 即通过。
+
+### 把 .img 导出成 XML 肉眼看
+
+```bash
+xml-img-patcher dump-xml "E:/Client/EN/String/Mob.img" "C:/out/Mob.xml" --linux
+```
+
+### 从服务端 git 仓库导出 xml + diff
+
+```bash
+# 按 commit hash
+xml-img-patcher export --from=27529d68 --repo="E:/LocalGit/GitHub/BeiDou-Server"
+
+# 按时间点（找该时刻前最近一次 commit 作为起点）
+xml-img-patcher export --from="2026-06-22 14:00" --repo="E:/LocalGit/GitHub/BeiDou-Server"
+```
+
+### 一站式工作流：从服务端拉 → 打到客户端 → 验
+
+```bash
+# Step 1: 从服务端 git 仓库导出补丁数据
+xml-img-patcher export --from=27529d68 \
+  --repo="E:/LocalGit/GitHub/BeiDou-Server" \
+  --out-xml=C:/upgrade --out-diff=C:/diff
+
+# Step 2a: wz 层（英文层）应用到客户端 EN 目录
+xml-img-patcher batch --full-xml-dir=C:/upgrade/wz \
+  E:/Client/EN C:/diff/wz C:/out/EN
+
+# Step 2b: wz-zh-CN 层应用到客户端 Data 目录
+xml-img-patcher batch --full-xml-dir=C:/upgrade/wz-zh-CN \
+  E:/Client/Data C:/diff/wz-zh-CN C:/out/Data
+
+# Step 3: 校验
+xml-img-patcher verify C:/out/Data/Quest/Say.img \
+  C:/diff/wz-zh-CN/Quest.wz/Say.img.xml.diff \
+  C:/upgrade/wz-zh-CN
+```
+
+**关键映射规则**（patch/batch 共用）：
+- 服务端 `wz/` 层 → 客户端 `EN/`（英文文本）目录（若不存在则回退到 `Data/`）
+- 服务端 `wz-zh-CN/` 层 → 客户端 `Data/`（中文汉化）目录
+- diff 路径 `String.wz/Mob.img.xml.diff` 自动剥 `.wz` 段 → img 路径 `String/Mob.img`
 
 ## 构建
 
-```
+要求 .NET 10.0+：
+
+```bash
 dotnet build MapleLib.XmlImgPatcher/MapleLib.XmlImgPatcher.csproj -c Release
 ```
 
 发布为 self-contained 单文件 exe（csproj 已默认 PublishSingleFile + win-x64）：
 
-```
+```bash
 dotnet publish MapleLib.XmlImgPatcher/MapleLib.XmlImgPatcher.csproj -c Release
+# 产物在 bin/Release/net10.0-windows/win-x64/publish/xml-img-patcher.exe
 ```
 
-## 例子
-
-```bat
-:: 单文件 patch + 提供完整 XML 上下文（diff 短时必备）
-xml-img-patcher patch ^
-  --full-xml="C:\upgrade_20260619\wz\String.wz\Mob.img.xml" ^
-  "E:\BeiDou-Client\EN\String\Mob.img" ^
-  "C:\diff_20260619\wz\String.wz\Mob.img.xml.diff" ^
-  "C:\out\Mob.img"
-
-:: 批量：把整个 wz/ 目录的 diff 都打到 EN/ 客户端 img 上
-xml-img-patcher batch ^
-  --full-xml-dir="C:\upgrade_20260619\wz" ^
-  "E:\BeiDou-Client\EN" ^
-  "C:\diff_20260619\wz" ^
-  "C:\out\EN"
-
-:: 批量：先 dry-run 看错误
-xml-img-patcher batch --dry-run ^
-  "E:\BeiDou-Client\EN" "C:\diff_20260619\wz" "C:\out\EN"
-
-:: 校验：patched img 的实际节点值是否和 diff 一致
-xml-img-patcher verify ^
-  "C:\out\EN\String\Mob.img" ^
-  "C:\diff_20260619\wz\String.wz\Mob.img.xml.diff" ^
-  "C:\upgrade_20260619\wz"
-
-:: 批量导出 XML（递归整个目录）
-xml-img-patcher batch-dump-xml ^
-  "E:\BeiDou-Client\Data" "C:\out_xml\Data"
-```
-
-## 验证与回归测试
-
-工具的正确性用真实数据回归验证过：21 个生产 diff（11 英文 + 10 中文）打在真实客户端 .img 上，三层校验全过。
-
-### 测试思路
-
-diff 是要执行的指令、完整 XML 是查路径的字典、.img 是被改的目标。所以验证也按这三层由严到松：
-
-1. **patch 自检**：CLI 输出 `0 failed` + 退出码 0——确认 21 个 batch 全跑通、没抛异常
-2. **verify 子命令逐字段比对**：每个 patched .img 直接被加载，把 diff 里**每一条 `+` 变更**按解出的路径取到运行时节点，跟期望值逐字段比（字符串全等、数值相等、vector x/y 相等、类型匹配）。这一层绕开 dump-xml 的序列化噪音，最权威
-3. **dump-xml 规范化对比 upgrade**：patched .img 导出成 XML，过滤掉 canvas/sound 等 patcher 不管的资源、按节点路径排序后，跟服务端 upgrade XML 比"该有的节点是否都在、值是否一致"。剩余差异都是客户端原本就有但服务端 XML 没有的字段（diff 没动 → patcher 也不动 → 是正确行为），不是漏改
-
-### 结果
-
-| 关卡 | 范围 | 结果 |
-|---|---|---|
-| batch patch | 21 diff → 21 patched img | 21/21 OK，0 fail，0 skip |
-| verify 逐字段 | 21 patched img × 共 2016 个 `+` 字段 | 2016/2016 match，0 miss |
-| dump-xml 规范化对比 | 21 patched vs upgrade | diff 触及的节点全一致；剩余差异均为客户端原有字段 |
-
-抽样的真值对照（节选）：
-
-| Case | 节点 | 期望值 | patched 实际 |
-|---|---|---|---|
-| zh Mob | `9999999/name` | 已杀怪物数 | ✓ |
-| en Mob | `9999999/name` | Hunted Monsters | ✓ |
-| zh Skill | `0001005/desc` | …300秒…（不再是 2小时） | ✓ |
-| en 0403 | `04031786`（整棵子树新增） | quest=1 | ✓ |
-| en Skill/000 | `0001005/level/1/cooltime`（深路径新增） | 300 | ✓ |
-
-### 测试中发现并修复的 2 个 bug
-
-真实数据跑出 4 个 batch 失败（EN/ZH 各 QuestInfo.img + Say.img），定位到两类 idempotent 缺陷，已修：
-
-1. **`ApplyAdd` leaf-on-leaf 抛 `already exists`**：客户端经常已经有 server 还没补的字段（如 `demandSummary`），diff 把它们当 ADD 是正常的，应当按 diff 覆盖而非拒绝
-2. **`ApplyDelete` 父节点已删抛 `parent not found`**：git diff 删一棵子树会逐叶发 DELETE，删完父节点后子节点 DELETE 找不到父节点，应当 no-op
-
-详见 commit `db33fba`。修复后 21/21 全过。
-
-### 复现（本机回归）
-
-测试数据放仓库根的 `test-runs/`（已 `.gitignore`，不入库）。结构：
-
-```
-test-runs/
-  input-en/  input-zh/      从客户端拷贝的 .img 输入（不污染原始 img）
-  patched-en/  patched-zh/   batch 输出
-  dumped-en/   dumped-zh/    batch-dump-xml 输出
-  reports/                    各步骤日志 + 三层校验报告
-  normalize2.py              dump-xml 规范化（过滤 canvas/sound + 按路径排序），用于第 3 层集合对比
-```
-
-复现步骤：
-
-```bat
-set EXE=MapleLib.XmlImgPatcher\bin\Release\net10.0-windows\win-x64\xml-img-patcher.exe
-
-:: 1) batch 两条线（EN / ZH）
-%EXE% batch --full-xml-dir="C:\upgrade_20260619\wz" ^
-  test-runs\input-en  C:\diff_20260619\wz  test-runs\patched-en   > test-runs\reports\01-batch-en.log 2>&1
-%EXE% batch --full-xml-dir="C:\upgrade_20260619\wz-zh-CN" ^
-  test-runs\input-zh  C:\diff_20260619\wz-zh-CN  test-runs\patched-zh > test-runs\reports\02-batch-zh.log 2>&1
-
-:: 2) verify 逐个 patched img（21 个，逐字段比对 —— 权威层）
-::    对每个 diff: %EXE% verify <patched.img> <diff> <对应 full-xml或目录>
-%EXE% verify test-runs\patched-en\String\Mob.img ^
-  C:\diff_20260619\wz\String.wz\Mob.img.xml.diff C:\upgrade_20260619\wz
-
-:: 3) dump-xml 后规范化对比 upgrade（第 3 层，集合差）
-%EXE% batch-dump-xml test-runs\patched-en test-runs\dumped-en
-py test-runs\normalize2.py <dumped.xml> <canon.xml>
-:: 再跟 upgrade 规范化后的 XML 做集合差（comm -13/-23），确认 diff 触及的节点都在且一致
-```
-
-通过标准：21/21 batch 退出码 0、21/21 verify `0 miss`、dump-xml 规范化后 diff 触及的路径全一致。
-
-## 内部模块
-
-| 文件 | 作用 |
-|---|---|
-| `Program.cs` | CLI 入口、参数解析、子命令分发 |
-| `Parser/XmlLineParser.cs` | 解析单行 XML 元素（`<imgdir>` / `<int>` / `<vector>` 等） |
-| `Parser/DiffParser.cs` | 解析 unified diff，按 hunk 维护 imgdir 栈，输出 `List<Change>`；可读 full-xml 给短 hunk 种栈 |
-| `Model/{Change,SubTree,ChangeOp,ValueType}.cs` | 数据模型 |
-| `Patcher/MapleLibAdapter.cs` | 封装 MapleLib 的 load / find / set / add / remove / save |
-| `Patcher/ImgPatcher.cs` | 协调器：load → 按 Delete-then-Modify-then-Add 相位顺序逐条 apply → save |
-
-## 语义说明
-
-`patch` 把 ADD 和 DELETE 都视作幂等：
-
-- **ADD 命中已存在节点**：按 diff 的值覆盖（不论容器还是叶子）。客户端经常已经有 server 还没补的字段，diff 把它们当 ADD 是正常情况
-- **DELETE 命中不存在节点 / 父节点不存在**：no-op。git diff 删一棵子树时会逐叶发 DELETE，删完父节点后子节点的 DELETE 自然没意义
-
-`ImgPatcher` 内部把所有变更按 `Delete → Modify → Add` 三相位重排再执行，避免 git diff 在同一对兄弟里同时出现 `+ <imgdir X>` 和 `- <imgdir X>` 时 ADD 后被 DELETE 误清。
-
-## 已知限制
-
-- 仅处理 `<imgdir>` / `<string>` / `<int>` / `<short>` / `<long>` / `<float>` / `<double>` / `<vector>` / `<null>` 这九种 diff 中常见的标签。`<canvas>` / `<sound>` / `<uol>` 等开标签若出现在 diff 中作为未知行被跳过——这些资源原本就不会出现在服务端瘦 XML 里
-- 不解析 diff 文件头里的路径，仅看 hunk 内容。多文件 diff 应当拆开传入
-- `--strict` 失败时不会回滚已应用的修改；但 `--dry-run` 不会写文件，可用于先校验
-- 短 hunk（深嵌套小改动）必须配 `--full-xml` / `--full-xml-dir` 才能正确推路径——hunk 上下文不含外层 `<imgdir>` 时光看 diff 推不出
-- `--full-xml` / `--full-xml-dir` 路径不存在时会输出 `[warn]` 但不中止（仍按无 full-xml 的方式跑）
-- `dump-xml` 输出风格（缩进 2 空格、`<x/>` 自闭合、`<null>` 标签写法）跟服务端 XML 不完全一致，文本级 diff 会有假阳性。需要严格比较时用 `verify` 子命令
+项目根 `publish.bat` 是封装好的一键构建，产出复制到 `dist/xml-img-patcher.exe`。
 
 ## 姊妹仓库
 
@@ -226,4 +215,4 @@ py test-runs\normalize2.py <dumped.xml> <canon.xml>
 | C# | <https://github.com/SleepNap/MapleLib-cli> | `dist/xml-img-patcher.exe`（.NET AOT/publish 单文件） |
 | Java | <https://github.com/SleepNap/orange-wz-cli> | `dist/xml-img-patcher.exe`（GraalVM native，standalone） |
 
-两边功能、子命令（`patch / dump-xml / batch / batch-dump-xml / verify / export`）、选项、退出码、输出格式**完全一致**，脚本可互换。两边 `dump-xml --linux` 输出逐字节一致。
+两边功能、子命令、选项、退出码、输出格式**完全一致**，脚本可互换。两边 `dump-xml --linux` 输出逐字节一致。
