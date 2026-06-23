@@ -51,6 +51,16 @@ namespace MapleLib.XmlImgPatcher.Patcher
             // though the DELETE must win (it speaks to the old tree, the ADD to the new one).
             // Running deletes first makes the upsert-on-ADD path see a clean slot and avoids
             // the "ADD then DELETE same node" race that wipes freshly-added subtrees.
+
+            // Before phasing, cancel out "false rename" pairs: when git fails to detect a
+            // rename and emits `- <imgdir X>` (DELETE) + `+ <imgdir X>` with NO plus-body
+            // children (the real children are the following context lines, which belong to X
+            // in both old and new trees), the DELETE + empty ADD pair is a no-op — X exists in
+            // both trees with identical content, only its sibling ordering changed. Applying
+            // the DELETE would drop X's children, then the empty ADD would re-add X as an empty
+            // container, losing data. Cancel both so the original subtree is preserved.
+            changes = CancelFalseRenames(changes);
+
             var ordered = new List<Change>(changes.Count);
             ordered.AddRange(changes.Where(c => c.Op == ChangeOp.Delete));
             ordered.AddRange(changes.Where(c => c.Op == ChangeOp.Modify));
@@ -131,6 +141,59 @@ namespace MapleLib.XmlImgPatcher.Patcher
             int n = 1;
             foreach (var ch in t.Children) n += CountNodes(ch);
             return n;
+        }
+
+        // Cancel "false rename" pairs produced when git doesn't recognize a rename and emits
+        // `- <imgdir X>` + `+ <imgdir X>` (empty body) with the real children as context lines.
+        // Such a DELETE + empty-ADD pair is a no-op: X exists in both trees with the same
+        // content. Remove both so the patcher leaves the original subtree untouched.
+        // An ADD is "empty" only when it's a Sub container with zero children — a genuinely
+        // new empty container (e.g. `<imgdir name="0"/>` self-closing, or an imgdir the diff
+        // truly empties) is NOT cancelled, because there's no matching DELETE-with-same-path
+        // for a truly new node and the pair check below guards real empties too.
+        private static IReadOnlyList<Change> CancelFalseRenames(IReadOnlyList<Change> changes)
+        {
+            var deletePaths = new HashSet<string>(
+                changes.Where(c => c.Op == ChangeOp.Delete).Select(c => c.PathString));
+
+            if (deletePaths.Count == 0) return changes;
+
+            bool changed = false;
+            var result = new List<Change>(changes.Count);
+            foreach (var c in changes)
+            {
+                if (c.Op == ChangeOp.Add
+                    && c.ValueType == ValueType.Sub
+                    && c.SubTree != null
+                    && c.SubTree.Children.Count == 0
+                    && deletePaths.Contains(c.PathString))
+                {
+                    // This empty ADD matches a DELETE at the same path → false rename.
+                    changed = true;
+                    continue;
+                }
+                result.Add(c);
+            }
+
+            if (!changed) return changes;
+
+            // Also drop the DELETEs whose path matched a cancelled empty ADD.
+            var cancelledAddPaths = new HashSet<string>(
+                changes.Where(c => c.Op == ChangeOp.Add
+                    && c.ValueType == ValueType.Sub
+                    && c.SubTree != null
+                    && c.SubTree.Children.Count == 0
+                    && deletePaths.Contains(c.PathString))
+                    .Select(c => c.PathString));
+
+            var final = new List<Change>(result.Count);
+            foreach (var c in result)
+            {
+                if (c.Op == ChangeOp.Delete && cancelledAddPaths.Contains(c.PathString))
+                    continue;
+                final.Add(c);
+            }
+            return final;
         }
     }
 }
