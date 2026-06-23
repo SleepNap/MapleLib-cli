@@ -160,17 +160,15 @@ namespace MapleLib.XmlImgPatcher.Patcher
             //      the same imgdir) — common for quest dialogue blocks.
             //  (b) diff `+`-only adds a leaf (or imgdir) that the client already has from a
             //      prior translation pass; here `diff is truth` means we should overwrite.
-            // Either way: treat ADD-on-existing as replace-in-place. Drop the old node and
-            // insert the rebuilt one under the same parent.
+            // For container-on-container, MERGE rather than replace: recurse into matching
+            // child names so existing children the diff didn't mention (canvas/sound/UOL and
+            // other binary resources, or sibling leaves) are preserved. Only children the diff
+            // explicitly re-adds get overwritten. This is critical because git diffs of server
+            // XML are "thin" (no canvas/sound), and the client img carries those resources —
+            // clearing them would lose binary data the diff never intended to touch.
             if (c.SubTree.Type == ValueType.Sub && existing is IPropertyContainer existingContainer)
             {
-                existingContainer.ClearProperties();
-                WzImageProperty rebuilt = BuildProperty(c.SubTree, overrideName: newName);
-                if (rebuilt is IPropertyContainer rebuiltContainer)
-                {
-                    foreach (WzImageProperty child in rebuiltContainer.WzProperties)
-                        existingContainer.AddProperty(child.DeepClone());
-                }
+                MergeSubTree(existingContainer, c.SubTree);
                 img.Changed = true;
                 return;
             }
@@ -235,6 +233,36 @@ namespace MapleLib.XmlImgPatcher.Patcher
         }
 
         // -------- value parsers (invariant culture, lenient) --------
+
+        // Merge a diff SubTree into an existing container in-place. For each child the diff
+        // mentions: if the target already has a child by that name, recurse (containers) or
+        // overwrite the value (leaves); otherwise add a freshly built child. Children the diff
+        // does NOT mention are left untouched — this is what preserves canvas/sound/UOL and
+        // other binary resources that exist in the client img but not in the thin server XML.
+        private static void MergeSubTree(IPropertyContainer target, SubTree diff)
+        {
+            foreach (var diffChild in diff.Children)
+            {
+                var existing = target[diffChild.Name];
+                if (existing == null)
+                {
+                    target.AddProperty(BuildProperty(diffChild));
+                    continue;
+                }
+
+                // Same name already present. Container-on-container → recurse to preserve
+                // untouched grandchildren. Anything else → replace the leaf in-place.
+                if (diffChild.Type == ValueType.Sub && existing is IPropertyContainer existingChildContainer)
+                {
+                    MergeSubTree(existingChildContainer, diffChild);
+                }
+                else
+                {
+                    target.RemoveProperty(existing);
+                    target.AddProperty(BuildProperty(diffChild));
+                }
+            }
+        }
 
         private static int ParseInt(string? s) =>
             int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) ? v : 0;
