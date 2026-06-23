@@ -40,6 +40,14 @@ namespace MapleLib.XmlImgPatcher
             WzMapleVersion version = WzMapleVersion.GMS;
             string? fullXml = null;
             string? fullXmlDir = null;
+            // export 子命令参数（与 Java 版 ExportCommand 对齐）
+            string? exportFrom = null;
+            string? exportRepo = null;
+            string? exportOutXml = null;
+            string? exportOutDiff = null;
+            var exportPrefixes = new List<string>();
+            bool exportNoDiff = false;
+            int exportContext = 30;
 
             foreach (string a in args)
             {
@@ -49,6 +57,7 @@ namespace MapleLib.XmlImgPatcher
                 else if (a == "--dry-run") dryRun = true;
                 else if (a == "--strict") strict = true;
                 else if (a == "--linux") linuxLineBreak = true;
+                else if (a == "--no-diff") exportNoDiff = true;
                 else if (a.StartsWith("--full-xml=", StringComparison.Ordinal))
                 {
                     fullXml = a.Substring("--full-xml=".Length);
@@ -60,6 +69,24 @@ namespace MapleLib.XmlImgPatcher
                     fullXmlDir = a.Substring("--full-xml-dir=".Length);
                     if (!string.IsNullOrEmpty(fullXmlDir) && !Directory.Exists(fullXmlDir))
                         Console.Error.WriteLine($"[warn] --full-xml-dir 目录不存在: {fullXmlDir}，将不使用路径回退");
+                }
+                else if (a.StartsWith("--from=", StringComparison.Ordinal))
+                    exportFrom = a.Substring("--from=".Length);
+                else if (a.StartsWith("--repo=", StringComparison.Ordinal))
+                    exportRepo = a.Substring("--repo=".Length);
+                else if (a.StartsWith("--out-xml=", StringComparison.Ordinal))
+                    exportOutXml = a.Substring("--out-xml=".Length);
+                else if (a.StartsWith("--out-diff=", StringComparison.Ordinal))
+                    exportOutDiff = a.Substring("--out-diff=".Length);
+                else if (a.StartsWith("--prefix=", StringComparison.Ordinal))
+                    exportPrefixes.Add(a.Substring("--prefix=".Length));
+                else if (a.StartsWith("--context=", StringComparison.Ordinal))
+                {
+                    if (!int.TryParse(a.Substring("--context=".Length), out exportContext))
+                    {
+                        Console.Error.WriteLine($"invalid --context value, must be integer");
+                        return 2;
+                    }
                 }
                 else if (a.StartsWith("--iv=", StringComparison.Ordinal))
                 {
@@ -91,7 +118,7 @@ namespace MapleLib.XmlImgPatcher
             // Decide subcommand. Default: `patch` (3 positionals, backwards-compat).
             string mode = "patch";
             var knownCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                { "patch", "dump-xml", "batch", "batch-dump-xml", "verify", "dump-changes" };
+                { "patch", "dump-xml", "batch", "batch-dump-xml", "verify", "dump-changes", "export" };
             if (positional.Count > 0 && knownCommands.Contains(positional[0]))
             {
                 mode = positional[0];
@@ -114,6 +141,7 @@ namespace MapleLib.XmlImgPatcher
                 "batch-dump-xml" => RunBatchDumpXml(positional, version, verbose, linuxLineBreak),
                 "verify" => RunVerify(positional, version, verbose, fullXmlDir),
                 "dump-changes" => RunDumpChanges(positional, fullXml),
+                "export" => RunExport(exportFrom, exportRepo, exportOutXml, exportOutDiff, exportPrefixes, exportNoDiff, exportContext, verbose),
                 _ => RunPatch(positional, version, verbose, dryRun, strict, fullXml),
             };
         }
@@ -384,6 +412,305 @@ namespace MapleLib.XmlImgPatcher
                 Console.Error.WriteLine($"dump-changes failed: {ex.Message}");
                 return 3;
             }
+        }
+
+        // ---------- export ----------
+        // 从 git 仓库导出补丁数据：把指定起点之后变更的 wz xml 抽出来，并生成对应的 diff。
+        // 与 Java 版 ExportCommand 对齐：--from 支持 commit hash / git ref，也支持 datetime
+        // （yyyy-MM-dd / yyyy-MM-ddTHH:mm:ss 等），datetime 模式会找该时间点之前最近的一个
+        // commit 作为起点，从而把该时间点之后的所有变更全部包含进来。
+        private static int RunExport(string? from, string? repoOpt, string? outXmlOpt, string? outDiffOpt,
+            List<string> prefixes, bool noDiff, int context, bool verbose)
+        {
+            if (string.IsNullOrEmpty(from))
+            {
+                Console.Error.WriteLine("usage: export --from=<commit-hash|datetime> [--repo=<dir>] [--out-xml=<dir>] [--out-diff=<dir>] [--prefix=<p>]... [--no-diff] [--context=<N>]");
+                return 2;
+            }
+
+            string startDir = repoOpt != null
+                ? Path.GetFullPath(repoOpt)
+                : Path.GetFullPath(Directory.GetCurrentDirectory());
+            string repoRoot = FindRepoRoot(startDir);
+            if (!Directory.Exists(Path.Combine(repoRoot, ".git")))
+            {
+                Console.Error.WriteLine($"[err] 不是 git 仓库（找不到 .git 目录）: {repoRoot}");
+                return 2;
+            }
+
+            string fromCommit;
+            try
+            {
+                fromCommit = ResolveFromCommit(from, repoRoot);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[err] 解析 --from 失败: {ex.Message}");
+                return 2;
+            }
+
+            List<string> effPrefixes = (prefixes == null || prefixes.Count == 0)
+                ? new List<string> { "gms-server/wz", "gms-server/wz-zh-CN" }
+                : prefixes;
+            string effOutXml = outXmlOpt ?? DefaultExportDir("upgrade_");
+            string effOutDiff = outDiffOpt ?? DefaultExportDir("diff_");
+
+            Console.Out.WriteLine("==========================================");
+            Console.Out.WriteLine("  补丁导出");
+            Console.Out.WriteLine($"  起点:     {from}{(fromCommit == from ? "" : "  →  " + fromCommit)}");
+            Console.Out.WriteLine($"  仓库:     {repoRoot}");
+            Console.Out.WriteLine($"  前缀:     [{string.Join(", ", effPrefixes)}]");
+            Console.Out.WriteLine($"  xml out:  {effOutXml}");
+            Console.Out.WriteLine($"  diff out: {(noDiff ? "(skipped)" : effOutDiff)}");
+            Console.Out.WriteLine("==========================================");
+
+            DeleteDirIfExists(effOutXml);
+            if (!noDiff) DeleteDirIfExists(effOutDiff);
+
+            int totalAdded = 0, totalDeleted = 0, totalFailed = 0;
+            foreach (string prefix in effPrefixes)
+            {
+                string shortName = LastSegment(prefix);
+                string targetDir = Path.Combine(effOutXml, shortName);
+                string diffDir = Path.Combine(effOutDiff, shortName);
+                Console.Out.WriteLine();
+                Console.Out.WriteLine($">>> {prefix}/");
+
+                List<string> changed = GitListFiles(fromCommit, prefix, "ACMR", repoRoot);
+                if (changed.Count == 0)
+                {
+                    Console.Out.WriteLine("  (无新增/修改)");
+                }
+                else
+                {
+                    foreach (string file in changed)
+                    {
+                        string src = Path.Combine(repoRoot, file.Replace('/', Path.DirectorySeparatorChar));
+                        if (!File.Exists(src))
+                        {
+                            Console.Out.WriteLine($"  ! 文件不存在(跳过): {file}");
+                            continue;
+                        }
+                        string rel = file.Substring(prefix.Length + 1);
+                        string dst = Path.Combine(targetDir, rel.Replace('/', Path.DirectorySeparatorChar));
+                        try
+                        {
+                            Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+                            File.Copy(src, dst, overwrite: true);
+                            if (verbose) Console.Out.WriteLine($"  + {file}");
+                            totalAdded++;
+                        }
+                        catch (Exception ex)
+                        {
+                            totalFailed++;
+                            Console.Error.WriteLine($"  ! 复制失败: {file} — {ex.Message}");
+                            continue;
+                        }
+                        if (!noDiff)
+                        {
+                            string diffDst = Path.Combine(diffDir, (rel + ".diff").Replace('/', Path.DirectorySeparatorChar));
+                            try
+                            {
+                                Directory.CreateDirectory(Path.GetDirectoryName(diffDst)!);
+                                WriteFileDiff(fromCommit, file, repoRoot, diffDst, context);
+                            }
+                            catch (Exception ex)
+                            {
+                                totalFailed++;
+                                Console.Error.WriteLine($"  ! diff 失败: {file} — {ex.Message}");
+                            }
+                        }
+                    }
+                }
+
+                List<string> deleted = GitListFiles(fromCommit, prefix, "D", repoRoot);
+                if (deleted.Count > 0)
+                {
+                    Console.Out.WriteLine("  [删除文件]");
+                    foreach (string f in deleted) Console.Out.WriteLine($"    [DEL] {f}");
+                    totalDeleted += deleted.Count;
+                }
+            }
+
+            Console.Out.WriteLine();
+            Console.Out.WriteLine("==========================================");
+            Console.Out.WriteLine("  导出完成");
+            Console.Out.WriteLine($"  新增/修改: {totalAdded}");
+            Console.Out.WriteLine($"  删除:      {totalDeleted}");
+            Console.Out.WriteLine($"  失败:      {totalFailed}");
+            Console.Out.WriteLine($"  xml out:   {effOutXml}");
+            if (!noDiff) Console.Out.WriteLine($"  diff out:  {effOutDiff}");
+            Console.Out.WriteLine("==========================================");
+            return totalFailed > 0 ? 1 : 0;
+        }
+
+        // 把 --from 解析成 commit hash：优先尝试 git rev-parse（hash/ref/HEAD~N），
+        // 失败则按 datetime 处理（在该时间点之前找最近一个 commit）。
+        private static string ResolveFromCommit(string input, string repoRoot)
+        {
+            string? resolved = TryGitRevParse(input, repoRoot);
+            if (resolved != null) return resolved;
+            return ResolveByDatetime(input, repoRoot);
+        }
+
+        private static string? TryGitRevParse(string refName, string repoRoot)
+        {
+            try
+            {
+                var (rc, stdout, _) = RunGit(repoRoot, "rev-parse", "--verify", refName + "^{commit}");
+                string trimmed = stdout.Trim();
+                if (rc == 0 && System.Text.RegularExpressions.Regex.IsMatch(trimmed, "^[0-9a-f]{40}$"))
+                    return trimmed;
+            }
+            catch { /* fall through */ }
+            return null;
+        }
+
+        private static string ResolveByDatetime(string input, string repoRoot)
+        {
+            DateTime? dt = TryParseDatetime(input);
+            if (dt == null)
+                throw new ArgumentException($"既不是 git ref 也不是合法 datetime: {input}");
+
+            // git log --until=<ISO> -1 取该时间点之前最近的一个 commit
+            string iso = dt.Value.ToString("yyyy-MM-ddTHH:mm:sszzz", System.Globalization.CultureInfo.InvariantCulture);
+            var (rc, stdout, _) = RunGit(repoRoot, "log", "--until=" + iso, "--pretty=format:%H", "-1");
+            string trimmed = stdout.Trim();
+            if (rc != 0 || !System.Text.RegularExpressions.Regex.IsMatch(trimmed, "^[0-9a-f]{40}$"))
+                throw new InvalidOperationException($"在 {iso} 之前找不到任何 commit");
+            return trimmed;
+        }
+
+        private static DateTime? TryParseDatetime(string s)
+        {
+            string[] patterns =
+            {
+                "yyyy-MM-ddTHH:mm:ss",
+                "yyyy-MM-dd HH:mm:ss",
+                "yyyy-MM-dd HH:mm",
+                "yyyy-MM-dd",
+                "yyyy/MM/dd HH:mm:ss",
+                "yyyy/MM/dd HH:mm",
+                "yyyy/MM/dd",
+                "yyyyMMdd",
+            };
+            foreach (string p in patterns)
+            {
+                if (DateTime.TryParseExact(s, p, System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.AssumeLocal, out DateTime dt))
+                    return dt;
+            }
+            return null;
+        }
+
+        // git log --diff-filter=<ACMR|D> --name-only fromCommit..HEAD -- <prefix>
+        private static List<string> GitListFiles(string fromCommit, string prefix, string diffFilter, string repoRoot)
+        {
+            var files = new List<string>();
+            var (rc, stdout, _) = RunGit(repoRoot,
+                "-c", "core.quotePath=false", "log",
+                fromCommit + "..HEAD",
+                "--diff-filter=" + diffFilter,
+                "--name-only",
+                "--pretty=format:",
+                "--",
+                prefix);
+            if (rc != 0) return files;
+            using var reader = new StringReader(stdout);
+            string? line;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            while ((line = reader.ReadLine()) != null)
+            {
+                line = line.Trim();
+                if (line.Length >= 2 && line.StartsWith("\"") && line.EndsWith("\""))
+                    line = line.Substring(1, line.Length - 2);
+                if (line.Length > 0 && seen.Add(line)) files.Add(line);
+            }
+            return files;
+        }
+
+        // git diff --binary -U<ctx> fromCommit..HEAD -- <file>  > outFile
+        private static void WriteFileDiff(string fromCommit, string file, string repoRoot, string outFile, int context)
+        {
+            int ctx = Math.Max(0, context);
+            var psi = new System.Diagnostics.ProcessStartInfo("git")
+            {
+                WorkingDirectory = repoRoot,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+            };
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add("core.quotePath=false");
+            psi.ArgumentList.Add("diff");
+            psi.ArgumentList.Add("--binary");
+            psi.ArgumentList.Add("-U" + ctx);
+            psi.ArgumentList.Add(fromCommit + "..HEAD");
+            psi.ArgumentList.Add("--");
+            psi.ArgumentList.Add(file);
+
+            using var proc = System.Diagnostics.Process.Start(psi)
+                ?? throw new InvalidOperationException("failed to start git diff");
+            // git diff 输出可能含二进制字节（--binary 模式），用字节级 stream 写
+            using (var fs = File.Create(outFile))
+            {
+                proc.StandardOutput.BaseStream.CopyTo(fs);
+            }
+            proc.WaitForExit();
+        }
+
+        // 跑 git，捕获 stdout/stderr。
+        private static (int rc, string stdout, string stderr) RunGit(string workingDir, params string[] args)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("git")
+            {
+                WorkingDirectory = workingDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+                StandardErrorEncoding = System.Text.Encoding.UTF8,
+            };
+            foreach (var a in args) psi.ArgumentList.Add(a);
+
+            using var proc = System.Diagnostics.Process.Start(psi)
+                ?? throw new InvalidOperationException("failed to start git");
+            string stdout = proc.StandardOutput.ReadToEnd();
+            string stderr = proc.StandardError.ReadToEnd();
+            proc.WaitForExit();
+            return (proc.ExitCode, stdout, stderr);
+        }
+
+        private static string FindRepoRoot(string start)
+        {
+            string? cur = Path.GetFullPath(start);
+            while (cur != null)
+            {
+                if (Directory.Exists(Path.Combine(cur, ".git"))) return cur;
+                cur = Path.GetDirectoryName(cur);
+            }
+            return start;
+        }
+
+        private static string LastSegment(string prefix)
+        {
+            int idx = prefix.LastIndexOf('/');
+            return idx < 0 ? prefix : prefix.Substring(idx + 1);
+        }
+
+        private static string DefaultExportDir(string tag)
+        {
+            string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string date = DateTime.Now.ToString("yyyyMMdd");
+            return Path.Combine(home, "Desktop", tag + date);
+        }
+
+        private static void DeleteDirIfExists(string dir)
+        {
+            if (!Directory.Exists(dir)) return;
+            try { Directory.Delete(dir, recursive: true); }
+            catch (Exception ex) { Console.Error.WriteLine($"  ! 无法删除目录: {dir} — {ex.Message}"); }
         }
 
         // ---------- verify ----------
@@ -702,6 +1029,7 @@ namespace MapleLib.XmlImgPatcher
             w.WriteLine("  xml-img-patcher batch          <img目录> <diff目录> <输出目录> [选项]");
             w.WriteLine("  xml-img-patcher batch-dump-xml <img目录> <xml输出目录>         [选项]");
             w.WriteLine("  xml-img-patcher verify         <patched.img> <diff> [full-xml或目录] [选项]");
+            w.WriteLine("  xml-img-patcher export         --from=<commit|datetime> [选项]");
             w.WriteLine();
             w.WriteLine("子命令说明：");
             w.WriteLine("  patch           对一个 .img 文件应用一个 .diff，输出新 .img。");
@@ -718,6 +1046,10 @@ namespace MapleLib.XmlImgPatcher
             w.WriteLine("                  和 img 节点的真实值逐条比对。绕过 dump-xml，所以测的是");
             w.WriteLine("                  img 内部内容本身，不受 XML 序列化影响。");
             w.WriteLine("                  第 3 个参数可给单个完整 XML 文件或目录（自动配对）。");
+            w.WriteLine("  export          从 git 仓库导出补丁数据：把指定起点之后变更的 wz xml 抽");
+            w.WriteLine("                  出来，并生成 git diff。--from 接受 commit hash 或 ref，");
+            w.WriteLine("                  也接受 datetime（如 2026-06-22），datetime 会找该时间点");
+            w.WriteLine("                  之前最近的一个 commit 作为起点。");
             w.WriteLine();
             w.WriteLine("通用选项：");
             w.WriteLine("  -h, --help             显示这个帮助。");
@@ -737,6 +1069,18 @@ namespace MapleLib.XmlImgPatcher
             w.WriteLine("      --full-xml-dir=<目录>  跟 --full-xml 同样作用，但是按 batch 的目录");
             w.WriteLine("                         结构去配对。建议批量跑时都加上。（仅 batch 用）");
             w.WriteLine("      --linux             dump-xml / batch-dump-xml 输出用 LF 行尾（默认 CRLF）");
+            w.WriteLine();
+            w.WriteLine("export 专用选项：");
+            w.WriteLine("      --from=<起点>      必填。git commit hash / ref（如 27529d68 / HEAD~3），");
+            w.WriteLine("                         或 datetime（如 2026-06-22 / 2026-06-22T15:30:00）。");
+            w.WriteLine("                         datetime 会找该时间点之前最近的一个 commit 作起点。");
+            w.WriteLine("      --repo=<目录>      git 仓库根目录（默认当前目录向上找 .git）");
+            w.WriteLine("      --out-xml=<目录>   xml 输出根目录（默认 ~/Desktop/upgrade_yyyyMMdd）");
+            w.WriteLine("      --out-diff=<目录>  diff 输出根目录（默认 ~/Desktop/diff_yyyyMMdd）");
+            w.WriteLine("      --prefix=<前缀>    需要扫描的目录前缀（相对仓库根），可重复多次。");
+            w.WriteLine("                         默认：--prefix=gms-server/wz --prefix=gms-server/wz-zh-CN");
+            w.WriteLine("      --no-diff          只复制 xml，不生成 diff");
+            w.WriteLine("      --context=<N>      git diff 上下文行数（-U），默认 30");
             w.WriteLine();
             w.WriteLine("退出码：");
             w.WriteLine("  0  全部成功");
@@ -774,6 +1118,12 @@ namespace MapleLib.XmlImgPatcher
             w.WriteLine("  # 批量导出 XML（递归整个目录）");
             w.WriteLine("  xml-img-patcher batch-dump-xml ^");
             w.WriteLine("    \"E:\\BeiDou-Client\\Data\" \"C:\\out_xml\\Data\"");
+            w.WriteLine();
+            w.WriteLine("  # 从 git commit 之后导出 wz xml + diff（默认输出到桌面）");
+            w.WriteLine("  xml-img-patcher export --from=27529d68 --repo=\"E:\\LocalGit\\GitHub\\BeiDou-Server\"");
+            w.WriteLine();
+            w.WriteLine("  # 用日期作为起点（找该日之前最近的一个 commit）");
+            w.WriteLine("  xml-img-patcher export --from=2026-06-22 --repo=\"E:\\LocalGit\\GitHub\\BeiDou-Server\"");
         }
     }
 }
