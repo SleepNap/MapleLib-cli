@@ -9,8 +9,8 @@ namespace MapleLib.WzLib.Util
 	public class XmlUtil
 	{
 
-		private static readonly char[] specialCharacters = {'"', '\'', '&', '<', '>'};
-		private static readonly string[] replacementStrings = {"&quot;", "&apos;", "&amp;", "&lt;", "&gt;"};
+		private static readonly char[] specialCharacters = {'"', '\'', '&', '<', '>', '\t', '\n', '\r'};
+		private static readonly string[] replacementStrings = {"&quot;", "&apos;", "&amp;", "&lt;", "&gt;", "&#x9;", "&#xA;", "&#xD;"};
 
 		public static string SanitizeText(string text)
 		{
