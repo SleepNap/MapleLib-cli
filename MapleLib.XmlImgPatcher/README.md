@@ -12,6 +12,7 @@ xml-img-patcher dump-xml       <input.img>  <output.xml>                [选项]
 xml-img-patcher batch          <img目录>    <diff目录>   <输出目录>      [选项]
 xml-img-patcher batch-dump-xml <img目录>    <xml输出目录>                [选项]
 xml-img-patcher verify         <patched.img> <diff>      [full-xml或目录][选项]
+xml-img-patcher export         --from=<hash或datetime>                  [选项]
 xml-img-patcher dump-changes   <diff>       [full-xml或目录]             [选项]
 ```
 
@@ -19,10 +20,11 @@ xml-img-patcher dump-changes   <diff>       [full-xml或目录]             [选
 |---|---|
 | `patch` | 单文件应用 diff，输出新 .img。保留 PNG/音效/UOL 等所有 diff 没碰过的资源 |
 | `dump-xml` | 把 .img 转成服务端格式的 .xml，方便对比或肉眼查看 |
-| `batch` | 批量 patch。`a/b/Foo.img.xml.diff` 自动配对 `<img目录>/a/b/Foo.img`（自动剥 `.wz` 段：`String.wz/Mob.img.xml.diff` ⇄ `String/Mob.img`）。递归扫整个 diff 目录 |
+| `batch` | 批量 patch。`a/b/Foo.img.xml.diff` 自动配对 `<img目录>/a/b/Foo.img`（自动剥 `.wz` 段）。递归扫整个 diff 目录 |
 | `batch-dump-xml` | 批量 dump-xml。递归把目录下所有 `.img` 转成 `.xml` |
-| `verify` | 直接加载 patched .img，逐个把 diff 里 `+` 变更跟节点的运行时值比对。绕开 dump-xml，测的是 .img 内部内容本身，最权威 |
-| `dump-changes` | 调试用：打印 DiffParser 解析 diff 后得到的所有 Change（op / path / value / 源行号），不写文件 |
+| `verify` | 直接加载 patched .img，逐个把 diff 里 `+` 变更跟节点的运行时值比对。最权威 |
+| `export` | 从 git 仓库导出服务端补丁 xml + diff。`--from` 支持 commit hash 或 datetime |
+| `dump-changes` | 调试用：打印 DiffParser 解析 diff 后得到的所有 Change |
 
 ## 选项
 
@@ -36,7 +38,14 @@ xml-img-patcher dump-changes   <diff>       [full-xml或目录]             [选
 | `--dry-run` | `patch`, `batch` | 加载 + 模拟应用，不写文件 |
 | `--strict` | `patch`, `batch` | 任意一条变更失败立即中止（默认尽力跑完后汇总） |
 | `--full-xml=<文件>` | `patch` | 服务端 patch 后的完整 XML。给短 hunk 提供上下文（深嵌套小改动靠这个才能定位到节点路径）。强烈建议常加 |
-| `--full-xml-dir=<目录>` | `batch` | 跟 `--full-xml` 同样作用，按 batch 的目录结构自动配对 |
+| `--full-xml-dir=<目录>` | `patch`, `batch` | 跟 `--full-xml` 同样作用，按目录结构自动配对 |
+| `--from=<hash或datetime>` | `export` | 起点（必填） |
+| `--repo=<dir>` | `export` | git 仓库根（默认当前目录） |
+| `--out-xml=<dir>` | `export` | xml 输出根（默认 ~/Desktop/upgrade_yyyyMMdd） |
+| `--out-diff=<dir>` | `export` | diff 输出根（默认 ~/Desktop/diff_yyyyMMdd） |
+| `--prefix=<pref>` | `export` | 扫描目录前缀（可多个，默认 gms-server/wz,wz-zh-CN） |
+| `--no-diff` | `export` | 只复制 xml，不生成 diff |
+| `--context=<N>` | `export` | git diff 上下文行数 -U（默认 30） |
 
 ## 退出码
 
@@ -209,3 +218,12 @@ py test-runs\normalize2.py <dumped.xml> <canon.xml>
 - 短 hunk（深嵌套小改动）必须配 `--full-xml` / `--full-xml-dir` 才能正确推路径——hunk 上下文不含外层 `<imgdir>` 时光看 diff 推不出
 - `--full-xml` / `--full-xml-dir` 路径不存在时会输出 `[warn]` 但不中止（仍按无 full-xml 的方式跑）
 - `dump-xml` 输出风格（缩进 2 空格、`<x/>` 自闭合、`<null>` 标签写法）跟服务端 XML 不完全一致，文本级 diff 会有假阳性。需要严格比较时用 `verify` 子命令
+
+## 姊妹仓库
+
+| 实现 | 仓库 | 产物 |
+|---|---|---|
+| C# | <https://github.com/SleepNap/MapleLib-cli> | `dist/xml-img-patcher.exe`（.NET AOT/publish 单文件） |
+| Java | <https://github.com/SleepNap/orange-wz-cli> | `dist/xml-img-patcher.exe`（GraalVM native，standalone） |
+
+两边功能、子命令（`patch / dump-xml / batch / batch-dump-xml / verify / export`）、选项、退出码、输出格式**完全一致**，脚本可互换。两边 `dump-xml --linux` 输出逐字节一致。
