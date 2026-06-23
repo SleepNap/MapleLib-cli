@@ -1,56 +1,21 @@
 # xml-img-patcher 待办（交接给下一个 AI）
 
-> 当前状态（commit `3170676`）：C# 版 CLI 31/31 verify 通过（含 DELETE 校验 + SubTree 递归展开）。但存在一个已知未修复的 DiffParser bug（见下文第 0 节）。
+> 当前状态（commit `f05b68e`）：C# 版 CLI 31/31 verify 通过（含 DELETE 校验 + SubTree 递归展开）。Say.img 4928/1 DiffParser bug 已修复，与 Java 版输出 size 一致。
 
-## 0. 已知未修复 bug：DiffParser plus block 内 sibling 容器丢失（Say.img 4928/1）
+## 0. ~~已知未修复 bug：DiffParser plus block 内 sibling 容器丢失（Say.img 4928/1）~~ ✅ 已修复
 
-**症状**：`wz-zh-CN/Quest.wz/Say.img.xml.diff` 的 hunk 19 里，`4928/1` 容器开标签在 plus block 内，但 close `</imgdir>` 落在 context 行（line 2519）而非 plus 行。C# DiffParser 处理时**丢失了 `1` 这一层**，导致 `1` 的子节点（stop/yes/ask/strings）全部浮到 `4928/` 根级，而不是 `4928/1/` 下。
+**修复 commit**：`f05b68e`
 
-**Java 版对照**：Java 版正确处理了这种情况，4928/1 子树完整。C# verify 假通过——用同一份有 bug 的 DiffParser 解析 diff 得到短路径 Change，然后在 C# patcher 自己写错的孤儿节点上"找到"了。
+**修法**：重写 `HandlePlusEntries`/`BuildSubTreeFrom`：
+- `HandlePlusEntries` 直接操作 outerStack（不再克隆 + 写回），ImgDirClose 直接 pop outerStack
+- 碰到 ImgDirClose 后继续处理后续 sibling，不 return
+- `BuildSubTreeFrom` 用本地 `List<SubTree> openStack` 跟踪嵌套，不碰共享 stack
+- 返回 `List<string>?` — null 表示完整闭合，非 null 列出未关嵌套容器名，由 `HandlePlusEntries` 将其 push 到 outerStack 供后续 context 行 pop
 
-**复现**：
-```bash
-# 看 C# 的 4928 结构，缺 1 容器
-dist/xml-img-patcher.exe dump-xml work/out_csharp/Data/Quest/Say.img /tmp/cs.xml
-awk '/imgdir name="4928"/,/imgdir name="4929"/' /tmp/cs.xml
-# 对比 Java 版，有 1 容器
-```
-
-**diff 形态**（关键部分）：
-```
-+ <imgdir name="1">           ← 4928/1 开，plus 行
-+   <string 0..7>             ← plus 行
-+   <int ask/>                ← plus 行
-+   <imgdir name="yes">       ← plus 行
-+     <string 0/>             ← plus 行
-  </imgdir>                    ← context 行（关 yes），不在 plus entries
-- <imgdir name="2">...         ← minus 行
-+ <imgdir name="stop">        ← plus 行，应该是 4928/1/stop
-+   <imgdir name="item">...
-+   ...
-+ </imgdir>                    ← plus 行，关 stop
-+ </imgdir>                    ← plus 行，关 1
-```
-
-**根因**：`HandlePlusEntries`（`DiffParser.cs:215`）处理 plus entries 时：
-1. 碰到 `<imgdir name="1">` push `1`，调 `BuildSubTreeFrom` 消耗子节点
-2. `BuildSubTreeFrom` 碰到 `<imgdir name="yes">` 递归 push yes，消耗 yes 的子节点
-3. yes 的 `</imgdir>` close 在 context 行（不在 entries），`BuildSubTreeFrom` 碰不到，**yes 没 pop**
-4. `BuildSubTreeFrom` 继续消耗，把后续 `<imgdir name="stop">` 当成 yes 的子节点
-5. 最终 `1` 容器的 SubTree 被错误构建，`1` 这层路径丢失
-
-**已尝试的修法（失败）**：
-- `HandlePlusEntries` 碰到 `</imgdir>` 时按 `stack.Count > initialDepth` 判断 pop 并 continue（不 return）→ 修好 4928/1 但 4937/1/stop/item 退化（plus block 内 sibling 容器顺序错乱，出现两个 `Add 4937/1/stop`）
-- 直接 `continue` 不 return → 同样退化
-
-**待尝试方向**：
-- `BuildSubTreeFrom` 需要能识别"这个 `</imgdir>` close 不在 entries 里，对应的 open 也不在，应该停止当前递归层级"。可能需要传一个"期望的 close 深度"参数，或者改成不依赖 entries 边界、而是按 indent 推断层级。
-- 或者：`HandlePlusEntries` 不用 `BuildSubTreeFrom` 递归，改成自己用 stack 状态机遍历 entries，碰到 `</imgdir>` 时按 indent 判断关的是哪层。
-- 参考 Java 版 `orange-wz-cli` 的 `DiffParser` 实现（它处理对了）。
-
-**影响**：仅影响"plus block 内有容器开标签、但对应 close 在 context 行"这种 diff 形态。生产数据中 Say.img hunk 19 触发，其他 30 个 diff 不受影响。
-
-**临时缓解**：无。verify 因用同一份 DiffParser 假通过，需要手工对照 Java 版 dump 才能发现。
+**验证**：
+- 31/31 patch + verify 全过
+- Say.img 与 Java 版 size 一致（2354183 字节），4928/1 子树正确归位
+- md5 仍与 Java 不同（MapleLib 序列化顺序差异），但节点数据正确
 
 ---
 
