@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using MapleLib.XmlImgPatcher.Sync;
 
 namespace MapleLib.XmlImgPatcher.Model
 {
@@ -26,6 +27,30 @@ namespace MapleLib.XmlImgPatcher.Model
 
         /// <summary>Originating diff line number — used for error reporting.</summary>
         public int SourceLine { get; }
+
+        /// <summary>
+        /// Action marker for sync (three-way merge) changes. Null for diff-parsed changes —
+        /// only sync populates this. Used to drive the human-review list and report.
+        /// </summary>
+        public ChangeAction? Action { get; init; }
+
+        /// <summary>
+        /// Sibling indices, parallel to <see cref="Path"/>: for each path segment, the 0-based
+        /// ordinal among same-named siblings at that level (0 = first occurrence). Empty for
+        /// diff-parsed changes (all segments resolve to the first occurrence), populated by sync
+        /// to disambiguate duplicated container/leaf names (e.g. two "8034" quest blocks).
+        /// </summary>
+        public IReadOnlyList<int>? SiblingIndices { get; init; }
+
+        /// <summary>
+        /// Sibling ordinal for path segment i (excluding the root name). Returns 0 when
+        /// <see cref="SiblingIndices"/> is null or shorter than i+1.
+        /// </summary>
+        public int SiblingIndexAt(int i)
+        {
+            if (SiblingIndices == null || i >= SiblingIndices.Count) return 0;
+            return SiblingIndices[i];
+        }
 
         public Change(
             IReadOnlyList<string> path,

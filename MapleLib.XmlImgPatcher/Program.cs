@@ -8,6 +8,7 @@ using MapleLib.WzLib.Serializer;
 using MapleLib.WzLib.WzProperties;
 using MapleLib.XmlImgPatcher.Parser;
 using MapleLib.XmlImgPatcher.Patcher;
+using MapleLib.XmlImgPatcher.Sync;
 
 namespace MapleLib.XmlImgPatcher
 {
@@ -48,6 +49,15 @@ namespace MapleLib.XmlImgPatcher
             var exportPrefixes = new List<string>();
             bool exportNoDiff = false;
             int exportContext = 30;
+            // sync 子命令参数（与 Java 版 SyncCommand 对齐）
+            string? syncServer = null;
+            string? syncRef = null;
+            string? syncClient = null;
+            string? syncOut = null;
+            bool syncInPlace = false;
+            bool syncStrict = false;
+            string syncMode = "review";
+            string? syncReviewOut = null;
 
             foreach (string a in args)
             {
@@ -80,6 +90,19 @@ namespace MapleLib.XmlImgPatcher
                     exportOutDiff = a.Substring("--out-diff=".Length);
                 else if (a.StartsWith("--prefix=", StringComparison.Ordinal))
                     exportPrefixes.Add(a.Substring("--prefix=".Length));
+                else if (a.StartsWith("--server=", StringComparison.Ordinal))
+                    syncServer = a.Substring("--server=".Length);
+                else if (a.StartsWith("--ref=", StringComparison.Ordinal))
+                    syncRef = a.Substring("--ref=".Length);
+                else if (a.StartsWith("--client=", StringComparison.Ordinal))
+                    syncClient = a.Substring("--client=".Length);
+                else if (a.StartsWith("--out=", StringComparison.Ordinal))
+                    syncOut = a.Substring("--out=".Length);
+                else if (a == "--in-place") syncInPlace = true;
+                else if (a.StartsWith("--mode=", StringComparison.Ordinal))
+                    syncMode = a.Substring("--mode=".Length);
+                else if (a.StartsWith("--review-out=", StringComparison.Ordinal))
+                    syncReviewOut = a.Substring("--review-out=".Length);
                 else if (a.StartsWith("--context=", StringComparison.Ordinal))
                 {
                     if (!int.TryParse(a.Substring("--context=".Length), out exportContext))
@@ -118,7 +141,7 @@ namespace MapleLib.XmlImgPatcher
             // Decide subcommand. Default: `patch` (3 positionals, backwards-compat).
             string mode = "patch";
             var knownCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                { "patch", "dump-xml", "batch", "batch-dump-xml", "verify", "dump-changes", "export" };
+                { "patch", "dump-xml", "batch", "batch-dump-xml", "verify", "dump-changes", "export", "sync" };
             if (positional.Count > 0 && knownCommands.Contains(positional[0]))
             {
                 mode = positional[0];
@@ -142,6 +165,8 @@ namespace MapleLib.XmlImgPatcher
                 "verify" => RunVerify(positional, version, verbose, fullXmlDir),
                 "dump-changes" => RunDumpChanges(positional, fullXml),
                 "export" => RunExport(exportFrom, exportRepo, exportOutXml, exportOutDiff, exportPrefixes, exportNoDiff, exportContext, verbose),
+                "sync" => RunSync(positional, syncServer, exportRepo, syncRef, exportFrom, syncClient, syncOut,
+                    exportPrefixes, version, syncInPlace, syncStrict, syncMode, syncReviewOut, dryRun, verbose),
                 _ => RunPatch(positional, version, verbose, dryRun, strict, fullXml),
             };
         }
@@ -821,10 +846,25 @@ namespace MapleLib.XmlImgPatcher
                 return false;
             }
 
+            // Case (3): an ADD descendant exists under a DELETEd container. The diff textually
+            // deletes a container (old tree) and re-adds it with new children (new tree), so the
+            // DELETE path itself no longer holds post-patch — the re-add rebuilds it. Only a
+            // DELETE with NO added descendant is a true removal. Descendants may be either
+            // containers or leaves (e.g. a bare "+ <string>" whose parent imgdirs are context
+            // lines) — check both, not just the container set.
+            bool HasAddDescendant(string path)
+            {
+                string prefix = path + "/";
+                foreach (var p in addPaths)
+                    if (p.StartsWith(prefix, StringComparison.Ordinal)) return true;
+                return false;
+            }
+
             var deletes = changes
                 .Where(c => c.Op == Model.ChangeOp.Delete
                             && !addPaths.Contains(c.PathString)
-                            && !HasAddAncestor(c.PathString))
+                            && !HasAddAncestor(c.PathString)
+                            && !HasAddDescendant(c.PathString))
                 .ToList();
 
             try
@@ -995,6 +1035,463 @@ namespace MapleLib.XmlImgPatcher
             Console.Out.WriteLine();
             Console.Out.WriteLine($"batch-dump-xml: {ok} ok, {fail} fail");
             return fail == 0 ? 0 : 1;
+        }
+
+        // ---------- sync ----------
+        // sync 把"服务端仓库同步到客户端 .img"收进内核，一行命令完成，替代 wz-sync.py。
+        // 直接节点级三方对比（old/new/client）产出 Change 列表喂给 ImgPatcher，不生成文本 diff。
+        //
+        // 三种"new"来源：
+        //   --server=<目录>          服务端 XML 目录（完全不需要 git，两方全量）
+        //   --repo + --ref=<ref>     git 某 ref（两方全量，git show <ref>:<path>）
+        //   --repo + --from=<ref|dt> git 增量（三方，git diff <from>..HEAD）
+        // 通用：
+        //   --client=<客户端根> --out=<输出根> [--prefix=...] [--iv] [--in-place] [--dry-run]
+        //   [--strict] [--mode=review|trust]
+        private static int RunSync(
+            List<string> positional,
+            string? serverDir,
+            string? repo,
+            string? refArg,
+            string? fromArg,
+            string? clientRoot,
+            string? outDir,
+            List<string> prefixes,
+            WzMapleVersion version,
+            bool inPlace,
+            bool strict,
+            string mode,
+            string? reviewOut,
+            bool dryRun,
+            bool verbose)
+        {
+            if (positional.Count > 0)
+            {
+                Console.Error.WriteLine($"sync 不接受位置参数: {string.Join(" ", positional)}");
+                return 2;
+            }
+            if (string.IsNullOrEmpty(clientRoot) || !Directory.Exists(clientRoot))
+            {
+                Console.Error.WriteLine($"--client 目录不存在: {clientRoot}");
+                return 2;
+            }
+            if (!inPlace && string.IsNullOrEmpty(outDir))
+            {
+                Console.Error.WriteLine("需要 --out=<目录> 或 --in-place");
+                return 2;
+            }
+            if (serverDir != null && repo != null)
+            {
+                Console.Error.WriteLine("--server 和 --repo 只能二选一");
+                return 2;
+            }
+            if (repo != null && string.IsNullOrEmpty(refArg) && string.IsNullOrEmpty(fromArg))
+            {
+                Console.Error.WriteLine("--repo 模式下需要 --ref 或 --from");
+                return 2;
+            }
+            if (!string.IsNullOrEmpty(refArg) && !string.IsNullOrEmpty(fromArg))
+            {
+                Console.Error.WriteLine("--ref 和 --from 只能二选一（ref=全量，from=增量）");
+                return 2;
+            }
+            bool trustMode = mode.Equals("trust", StringComparison.OrdinalIgnoreCase);
+            if (!trustMode && !mode.Equals("review", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.Error.WriteLine($"未知 --mode: {mode}（可用值: review / trust）");
+                return 2;
+            }
+            if (serverDir != null && !Directory.Exists(serverDir))
+            {
+                Console.Error.WriteLine($"--server 目录不存在: {serverDir}");
+                return 2;
+            }
+
+            // Determine effective prefixes (layer → client mapping).
+            var effPrefixes = prefixes.Count > 0
+                ? prefixes
+                : new List<string> { "gms-server/wz", "gms-server/wz-zh-CN" };
+
+            // Locate git repo root if in git mode.
+            string? repoRoot = null;
+            string? fromCommit = null;
+            if (repo != null)
+            {
+                repoRoot = FindRepoRoot(Path.GetFullPath(repo));
+                if (!Directory.Exists(Path.Combine(repoRoot, ".git")))
+                {
+                    Console.Error.WriteLine($"不是 git 仓库: {repoRoot}");
+                    return 2;
+                }
+                if (!string.IsNullOrEmpty(fromArg))
+                {
+                    try { fromCommit = ResolveFromCommit(fromArg, repoRoot); }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"解析 --from 失败: {ex.Message}");
+                        return 2;
+                    }
+                }
+            }
+
+            string effOut = inPlace ? clientRoot : Path.GetFullPath(outDir!);
+
+            Console.Out.WriteLine("==========================================");
+            Console.Out.WriteLine("  服务端 → 客户端 同步");
+            Console.Out.WriteLine($"  source:  {(serverDir != null ? "--server=" + serverDir
+                        : (refArg != null ? $"--repo={repo} --ref={refArg}" : $"--repo={repo} --from={fromArg}"))}");
+            Console.Out.WriteLine($"  client:  {clientRoot}");
+            Console.Out.WriteLine($"  out:     {(inPlace ? "(in-place)" : effOut)}");
+            Console.Out.WriteLine($"  mode:    {(trustMode ? "trust" : "review")}{(strict ? ", strict" : "")}");
+            Console.Out.WriteLine("==========================================");
+
+            // Gather the file list (mode-specific).
+            var files = new List<(string status, string serverPath)>();
+            if (serverDir != null)
+            {
+                foreach (string f in Directory.GetFiles(serverDir, "*.xml", SearchOption.AllDirectories))
+                {
+                    string rel = Path.GetRelativePath(serverDir, f);
+                    files.Add(("M", rel.Replace('\\', '/')));
+                }
+            }
+            else if (!string.IsNullOrEmpty(refArg))
+            {
+                foreach (string p in effPrefixes)
+                    foreach (string f in GitListFilesAtRef(repoRoot!, refArg, p))
+                        files.Add(("M", f));
+            }
+            else
+            {
+                foreach (string p in effPrefixes)
+                    foreach (string f in GitListFiles(fromCommit!, p, "ACMR", repoRoot!))
+                        files.Add(("M", f));
+            }
+
+            // Dedup by client rel path; zh layer wins over en (wz-zh-CN → Data, wz → EN/Data).
+            var byRel = new Dictionary<string, (int prio, string status, string path)>();
+            foreach (var (status, path) in files)
+            {
+                if (MapServerRelToClient(path) is not (var rest, var layer)) continue;
+                if (rest == null || layer == null) continue;
+                string clientRel = ClientRelFor(layer, rest, clientRoot);
+                if (clientRel == null) continue;
+                int prio = layer == "wz-zh-CN" ? 0 : 1;
+                if (!byRel.TryGetValue(clientRel, out var cur) || prio < cur.prio)
+                    byRel[clientRel] = (prio, status, path);
+            }
+            var ordered = byRel.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase).ToList();
+
+            Console.Out.WriteLine($"共 {ordered.Count} 个文件待处理");
+            int okCount = 0, failCount = 0, noChange = 0, reviewItems = 0;
+            var failList = new List<string>();
+            var reviewList = new List<string>();
+
+            var adapter = new MapleLibAdapter(version);
+            int i = 0;
+            foreach (var (clientRel, (_, status, serverPath)) in ordered)
+            {
+                i++;
+                Console.Out.WriteLine($"[{i}/{ordered.Count}] {Path.GetFileName(serverPath)} ({status}) -> {clientRel}");
+                try
+                {
+                    var r = ProcessSyncFile(
+                        serverPath, serverDir, repoRoot, refArg, fromCommit,
+                        clientRoot, effOut, version, inPlace, strict, trustMode,
+                        dryRun, verbose, adapter, clientRel);
+                    if (r.NoChange) noChange++;
+                    else if (r.Ok) { okCount++; reviewItems += r.ReviewCount; reviewList.AddRange(r.ReviewItems); }
+                    else { failCount++; failList.Add($"{serverPath} ({r.Error})"); }
+                }
+                catch (Exception ex)
+                {
+                    failCount++;
+                    failList.Add($"{serverPath} ({ex.Message})");
+                    if (verbose) Console.Error.WriteLine(ex);
+                }
+            }
+
+            Console.Out.WriteLine();
+            Console.Out.WriteLine("================ SYNC SUMMARY ================");
+            Console.Out.WriteLine($"ok:       {okCount}");
+            Console.Out.WriteLine($"nochange: {noChange}");
+            Console.Out.WriteLine($"fail:     {failCount}");
+            Console.Out.WriteLine($"review:   {reviewItems}");
+            if (reviewList.Count > 0)
+            {
+                Console.Out.WriteLine("---- 人工复核清单 ----");
+                foreach (var s in reviewList) Console.Out.WriteLine("  " + s);
+            }
+            foreach (var f in failList) Console.Out.WriteLine($"  [fail] {f}");
+
+            // --review-out=<file>: 把人工复核清单写到文件（每行一条），与 Java 版对齐。
+            if (!string.IsNullOrEmpty(reviewOut) && reviewList.Count > 0)
+            {
+                try
+                {
+                    string? dir = Path.GetDirectoryName(Path.GetFullPath(reviewOut));
+                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                    File.WriteAllLines(reviewOut, reviewList);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[err] 写入 review 清单失败: {reviewOut} — {ex.Message}");
+                }
+            }
+            return failCount == 0 ? 0 : 1;
+        }
+
+        // Per-file sync: load old/new/client, three-way merge → changes, patch, verify inline.
+        private static SyncFileResult ProcessSyncFile(
+            string serverPath,          // rel under serverDir (mode A) OR full "gms-server/..." path (git modes)
+            string? serverDir,          // mode A root (null in git modes)
+            string? repoRoot,           // git modes root (null in mode A)
+            string? refArg,             // git new ref (for --ref full-match)
+            string? fromCommit,         // git old ref (for --from three-way); null → two-way
+            string clientRoot,
+            string outRoot,
+            WzMapleVersion version,
+            bool inPlace,
+            bool strict,
+            bool trustMode,
+            bool dryRun,
+            bool verbose,
+            MapleLibAdapter adapter,
+            string clientRel)
+        {
+            // 1. Fetch old / new text.
+            string? oldText = null;
+            string? newText = null;
+            if (serverDir != null)
+            {
+                newText = File.ReadAllText(Path.Combine(serverDir, serverPath.Replace('/', Path.DirectorySeparatorChar)));
+            }
+            else
+            {
+                string newRef = !string.IsNullOrEmpty(refArg) ? refArg! : "HEAD";
+                newText = GitShow(repoRoot!, newRef, serverPath);
+                if (fromCommit != null)
+                    oldText = GitShow(repoRoot!, fromCommit, serverPath);
+            }
+            if (newText == null)
+            {
+                return new SyncFileResult(false, false, 0, 0, new List<string>(), "git 无此文件");
+            }
+
+            // 2. Map to client img path.
+            if (MapServerRelToClient(serverPath) is not (var rest, var layer)) return new SyncFileResult(false, false, 0, 0, new List<string>(), "路径解析失败");
+            string clientImg = Path.Combine(clientRoot, clientRel.Replace('/', Path.DirectorySeparatorChar));
+            if (!File.Exists(clientImg))
+            {
+                return new SyncFileResult(false, false, 0, 0, new List<string>(), "客户端 img 不存在");
+            }
+
+            // 3. Parse trees.
+            Node oldNode = oldText == null ? null! : XmlNodeParser.Parse(oldText);
+            Node newNode = XmlNodeParser.Parse(newText);
+            WzImage img = adapter.LoadImg(clientImg);
+            Node clientNode = ImgNodeReader.Read(img);
+            img.Dispose(); // free the image after reading the Node tree
+
+            // 4. Three-way merge → changes.
+            var merge = ThreeWayMerge.Merge(oldNode, newNode, clientNode, trustMode, strict);
+            var changes = merge.Changes;
+            var reviewItems = new List<string>();
+            // Change-backed review entries (third-default / type-conflict).
+            if (merge.ReviewCount > 0)
+            {
+                foreach (var c in changes)
+                {
+                    if (c.Action is ChangeAction.ModifyThirdDefault or ChangeAction.TypeConflict)
+                        reviewItems.Add(FormatReviewItem(c, clientNode));
+                }
+            }
+            // Non-Change review entries (missing-unmodified etc.).
+            reviewItems.AddRange(merge.ReviewItems);
+
+            if (changes.Count == 0)
+            {
+                // No change → copy img to out (unless in-place no-op).
+                if (!dryRun && !inPlace)
+                {
+                    string outImg = Path.Combine(outRoot, clientRel.Replace('/', Path.DirectorySeparatorChar));
+                    Directory.CreateDirectory(Path.GetDirectoryName(outImg)!);
+                    File.Copy(clientImg, outImg, overwrite: true);
+                }
+                return new SyncFileResult(true, true, 0, 0, reviewItems, null);
+            }
+
+            // 5. Patch.
+            string outputImg = Path.Combine(outRoot, clientRel.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(outputImg)!);
+            var patcher = new ImgPatcher(adapter, verbose, strict, dryRun, Console.Out, Console.Error);
+            var result = patcher.Patch(clientImg, changes, outputImg);
+            if (result.Failed > 0)
+            {
+                return new SyncFileResult(false, false, result.Applied, merge.ReviewCount, reviewItems, $"{result.Failed} 条失败");
+            }
+
+            // 6. Verify inline (unless dry-run — nothing written).
+            int miss = 0;
+            if (!dryRun)
+            {
+                WzImage outImg = adapter.LoadImg(outputImg);
+                miss = VerifyChangeList(adapter, outImg, changes, verbose, Console.Error);
+                outImg.Dispose();
+            }
+
+            return new SyncFileResult(result.Failed == 0, false, result.Applied, merge.ReviewCount, reviewItems, miss > 0 ? $"{miss} miss" : null);
+        }
+
+        private sealed class SyncFileResult
+        {
+            public bool Ok;
+            public bool NoChange;
+            public int Applied;
+            public int ReviewCount;
+            public List<string> ReviewItems;
+            public string? Error;
+            public SyncFileResult(bool ok, bool noChange, int applied, int review, List<string> reviewItems, string? error)
+            { Ok = ok; NoChange = noChange; Applied = applied; ReviewCount = review; ReviewItems = reviewItems; Error = error; }
+        }
+
+        // Map a server-side path (rel under --server, or full "gms-server/<layer>/...") to
+        // (rest-path-without-layer, layer). Returns null if unparseable.
+        private static (string? rest, string? layer)? MapServerRelToClient(string serverPath)
+        {
+            string p = serverPath.Replace('\\', '/');
+            if (p.StartsWith("gms-server/", StringComparison.Ordinal))
+                p = p.Substring("gms-server/".Length);
+            int slash = p.IndexOf('/');
+            if (slash < 0) return null;
+            string layer = p.Substring(0, slash);
+            string rest = p.Substring(slash + 1);
+            if (rest.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+                rest = rest.Substring(0, rest.Length - ".xml".Length);
+            // strip ".wz" from each directory segment (Quest.wz → Quest)
+            var segs = rest.Split('/');
+            for (int j = 0; j < segs.Length; j++)
+                if (segs[j].EndsWith(".wz", StringComparison.OrdinalIgnoreCase))
+                    segs[j] = segs[j].Substring(0, segs[j].Length - 3);
+            return (string.Join('/', segs), layer);
+        }
+
+        // layer → client root-relative path: wz-zh-CN → Data/, wz → EN/ (fallback Data/ if EN missing).
+        private static string? ClientRelFor(string layer, string rest, string clientRoot)
+        {
+            if (layer == "wz-zh-CN") return "Data/" + rest;
+            if (layer == "wz")
+            {
+                string en = "EN/" + rest;
+                string enAbs = Path.Combine(clientRoot, en.Replace('/', Path.DirectorySeparatorChar));
+                return File.Exists(enAbs) ? en : "Data/" + rest;
+            }
+            return null;
+        }
+
+        private static string FormatReviewItem(Model.Change c, Node? clientNode)
+        {
+            string cv = ClientLeafValue(clientNode, c) ?? "<null>";
+            string nv = c.Value ?? "<null>";
+            return $"{c.Action} {c.PathString}  (client={Short(cv)}, new={Short(nv)})";
+        }
+
+        // Resolve a leaf value from the client Node tree by path + sibling ordinal (used for
+        // review lines). Honors Change.SiblingIndices so a duplicated name (e.g. the two "2277"
+        // quest blocks) resolves to the correct instance instead of always the first.
+        private static string? ClientLeafValue(Node? root, Model.Change c)
+        {
+            if (root == null || c.Path.Count == 0) return null;
+            Node cur = root;
+            for (int i = 0; i < c.Path.Count; i++)
+            {
+                string seg = c.Path[i];
+                int ordinal = c.SiblingIndexAt(i);
+                Node? next = null;
+                int seen = 0;
+                foreach (var ch in cur.Children)
+                {
+                    if (ch.Name == seg)
+                    {
+                        if (seen == ordinal) { next = ch; break; }
+                        seen++;
+                    }
+                }
+                if (next == null) return null;
+                cur = next;
+            }
+            return cur.Value;
+        }
+
+        // git show <ref>:<path> → file content, or null if missing at that ref.
+        private static string? GitShow(string repoRoot, string refName, string path)
+        {
+            var (rc, stdout, _) = RunGit(repoRoot, "-c", "core.quotePath=false", "show", $"{refName}:{path}");
+            return rc == 0 ? stdout : null;
+        }
+
+        // git ls-tree -r --name-only <ref> -- <prefix> → file list.
+        private static List<string> GitListFilesAtRef(string repoRoot, string refName, string prefix)
+        {
+            var files = new List<string>();
+            var (rc, stdout, _) = RunGit(repoRoot, "ls-tree", "-r", "--name-only", refName, "--", prefix);
+            if (rc != 0) return files;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            using var reader = new StringReader(stdout);
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                line = line.Trim();
+                if (line.Length > 0 && seen.Add(line)) files.Add(line);
+            }
+            return files;
+        }
+
+        // Verify a Change list against a patched img. Flattens ADD SubTrees into leaf
+        // expectations. Simpler than RunVerify (which must tolerate messy text-diff shapes);
+        // sync changes come from a clean three-way merge so no false-rename filtering needed.
+        private static int VerifyChangeList(MapleLibAdapter adapter, WzImage img, List<Model.Change> changes, bool verbose, TextWriter err)
+        {
+            var expected = new List<Model.Change>();
+            foreach (var c in changes)
+            {
+                if (c.Op == Model.ChangeOp.Add && c.ValueType == Model.ValueType.Sub && c.SubTree != null)
+                {
+                    var parent = c.Path.Count > 0
+                        ? new List<string>(c.Path.Take(c.Path.Count - 1))
+                        : new List<string>();
+                    FlattenSubTree(parent, c.SubTree, 0, expected);
+                }
+                else
+                {
+                    expected.Add(c);
+                }
+            }
+            int match = 0, miss = 0;
+            foreach (var c in expected)
+            {
+                if (c.Op == Model.ChangeOp.Delete)
+                {
+                    if (adapter.GetByPath(img, c.Path, c.SiblingIndices) == null) match++;
+                    else { miss++; err.WriteLine($"[miss] DELETE {c.PathString} — still present"); }
+                    continue;
+                }
+                var node = adapter.GetByPath(img, c.Path, c.SiblingIndices);
+                if (node == null)
+                {
+                    miss++;
+                    err.WriteLine($"[miss] {c.PathString} — node not found");
+                    continue;
+                }
+                if (Matches(node, c)) { match++; if (verbose) Console.Out.WriteLine($"[ok ] {c.PathString}"); }
+                else
+                {
+                    miss++;
+                    err.WriteLine($"[miss] {c.PathString} — want={Short(c.Value)} got={Short(NodeValue(node))}");
+                }
+            }
+            if (verbose) Console.Out.WriteLine($"verify-inline: {expected.Count} expected, {match} match, {miss} miss");
+            return miss;
         }
 
         // ---------- help ----------

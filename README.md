@@ -22,6 +22,7 @@ xml-img-patcher batch-dump-xml <img目录> <xml输出目录>         [选项]
 xml-img-patcher verify         <patched.img> <diff> [full-xml或目录] [选项]
 xml-img-patcher export         --from=<hash或datetime>        [选项]
 xml-img-patcher dump-changes   <diff>       [full-xml或目录]  [选项]
+xml-img-patcher sync           --client=<客户端根> --out=<输出根> [选项]
 ```
 
 | 子命令 | 作用 |
@@ -33,6 +34,7 @@ xml-img-patcher dump-changes   <diff>       [full-xml或目录]  [选项]
 | `verify` | 校验：直接加载 patch 后的 .img，把 diff 里每条 + 变更（Add/Modify）查节点比对值；DELETE 查节点是否已消失。绕过 dump-xml 序列化，测的就是 img 的实际内容 |
 | `export` | 从 git 仓库导出指定起点之后的 wz xml 与 diff。`--from` 同时支持 commit hash 和 datetime |
 | `dump-changes` | 调试用：打印 DiffParser 解析 diff 后得到的所有 Change（op / path / value / 源行号），不写文件 |
+| `sync` | **从服务端仓库/目录直接同步到客户端 img**（节点级三方对比，砍掉文本 diff）。三种来源：`--repo+--from`（git 增量）、`--server=<xml目录>`（全量匹配）、`--repo+--ref`（git 全量）。替代 wz-sync.py 的 Python 编排 |
 
 ### patch 选项
 
@@ -80,6 +82,25 @@ xml-img-patcher dump-changes   <diff>       [full-xml或目录]  [选项]
 | `--prefix <pref>` | 扫描目录前缀（可多个，默认 gms-server/wz、gms-server/wz-zh-CN） |
 | `--no-diff` | 只复制 xml，不生成 diff |
 | `--context <N>` | git diff 上下文行数 -U（默认 30） |
+
+### sync 选项
+
+| 选项 | 说明 |
+|---|---|
+| `--repo <dir>` | git 仓库根目录。给 `--from` → 增量模式；给 `--ref` → git 全量 |
+| `--from <hash或datetime>` | 起点。增量模式（带 DELETE 意图 + 报告改了什么） |
+| `--ref <ref>` | git ref/tag/branch。全量模式（不需要 from 基线） |
+| `--server <dir>` | 服务端 XML 目录。全量匹配（完全不需要 git） |
+| `--client <dir>` | 客户端根目录（必填） |
+| `--out <dir>` | 输出根（默认写这里；`--in-place` 时可省略） |
+| `--in-place` | 直接写客户端（默认安全模式：先出 out 再部署） |
+| `--mode review\|trust` | 值差异标记语义（默认 review）。review 把 third-default 列进复核清单；trust 静默对齐 |
+| `--review-out <file>` | 把人工复核清单写到文件（每行一条） |
+| `--strict` | 两方全量下，client 独有业务节点也 DELETE（二进制永远保留） |
+| `--prefix <pref>` | 扫描目录前缀（可多个，默认 gms-server/wz、gms-server/wz-zh-CN） |
+| `--iv / --dry-run / -v` | 同其他子命令 |
+
+**sync 的层→客户端映射**：`wz-zh-CN`→`Data/`，`wz`→`EN/`（EN 不存在 fallback `Data/`），同 img 多层映射时 zh 优先。
 
 ## 退出码
 
@@ -186,10 +207,34 @@ xml-img-patcher verify C:/out/Data/Quest/Say.img \
   C:/upgrade/wz-zh-CN
 ```
 
-**关键映射规则**（patch/batch 共用）：
+**关键映射规则**（patch/batch/sync 共用）：
 - 服务端 `wz/` 层 → 客户端 `EN/`（英文文本）目录（若不存在则回退到 `Data/`）
 - 服务端 `wz-zh-CN/` 层 → 客户端 `Data/`（中文汉化）目录
 - diff 路径 `String.wz/Mob.img.xml.diff` 自动剥 `.wz` 段 → img 路径 `String/Mob.img`
+
+### 用 sync 直接同步（替代 Python 编排）
+
+`sync` 走节点级三方对比，**不生成文本 diff**，替代 wz-sync.py 那套 Python 编排：
+
+```bash
+# git 增量（--from 起点 → HEAD 的变更，带 DELETE 意图 + 复核清单）
+xml-img-patcher sync --repo=E:/LocalGit/GitHub/BeiDou-Server \
+  --from=27529d68 \
+  --client=E:/LocalGit/GitHub/BeiDou-Client \
+  --out=C:/out \
+  --review-out=C:/out/review.txt
+
+# 服务端 XML 目录全量匹配（完全不需要 git）
+xml-img-patcher sync --server=C:/upgrade/wz-zh-CN \
+  --client=E:/LocalGit/GitHub/BeiDou-Client \
+  --out=C:/out
+
+# git 某 ref 全量匹配（不需要 from 基线）
+xml-img-patcher sync --repo=E:/LocalGit/GitHub/BeiDou-Server --ref=HEAD \
+  --client=E:/LocalGit/GitHub/BeiDou-Client --out=C:/out
+```
+
+末尾打印 `SYNC SUMMARY`（ok/nochange/fail/review）+ 人工复核清单（third-default / type-conflict / missing-unmodified）。
 
 ## 构建
 

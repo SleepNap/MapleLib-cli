@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using MapleLib.WzLib;
 using MapleLib.WzLib.Serializer;
 using MapleLib.WzLib.WzProperties;
@@ -52,49 +53,144 @@ namespace MapleLib.XmlImgPatcher.Patcher
         // dropped — covers the case where the diff hunk includes the file-root imgdir.
         public WzImageProperty? GetByPath(WzImage img, IReadOnlyList<string> path)
         {
+            return GetByPath(img, path, siblingIndices: null);
+        }
+
+        // Like GetByPath but honours per-segment sibling ordinals (from Change.SiblingIndices)
+        // so a Change targeting the 2nd of two same-named containers resolves to the right one.
+        public WzImageProperty? GetByPath(WzImage img, IReadOnlyList<string> path, IReadOnlyList<int>? siblingIndices)
+        {
             if (path.Count == 0) return null;
-            var hit = img.GetFromPath(string.Join("/", path));
+            var hit = ResolveByIndex(img, path, siblingIndices);
             if (hit != null) return hit;
             if (path.Count >= 2 && path[0].EndsWith(".img", StringComparison.OrdinalIgnoreCase))
             {
                 var stripped = new List<string>(path.Count - 1);
                 for (int i = 1; i < path.Count; i++) stripped.Add(path[i]);
-                return img.GetFromPath(string.Join("/", stripped));
+                var strippedIndices = siblingIndices == null ? null
+                    : (siblingIndices.Count > 0 ? siblingIndices.Skip(1).ToList() : null);
+                return ResolveByIndex(img, stripped, strippedIndices);
             }
             return null;
         }
 
-        public IPropertyContainer? GetParent(WzImage img, IReadOnlyList<string> path)
+        // Walk from the image root, consuming each (segment, ordinal) pair. Ordinal 0 = first
+        // same-named child. Falls back to first-match when siblingIndices is null/short.
+        private static WzImageProperty? ResolveByIndex(WzImage img, IReadOnlyList<string> path, IReadOnlyList<int>? siblingIndices)
+        {
+            IPropertyContainer cur = img;
+            int i = 0;
+            foreach (string seg in path)
+            {
+                int ordinal = siblingIndices != null && i < siblingIndices.Count ? siblingIndices[i] : 0;
+                i++;
+                var child = ChildByName(cur, seg, ordinal);
+                if (child == null) return null;
+                if (i == path.Count) return child;
+                if (child is IPropertyContainer pc) { cur = pc; }
+                else return null; // path continues past a leaf — not found
+            }
+            return null;
+        }
+
+        // Nth same-named child (ordinal 0 = first) under a container. Throws nothing.
+        private static WzImageProperty? ChildByName(IPropertyContainer container, string name, int ordinal)
+        {
+            int seen = 0;
+            foreach (WzImageProperty p in container.WzProperties)
+            {
+                if (p.Name == name || (p.Name != null && p.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+                {
+                    if (seen == ordinal) return p;
+                    seen++;
+                }
+            }
+            return null;
+        }
+
+        public IPropertyContainer? GetParent(WzImage img, IReadOnlyList<string> path, IReadOnlyList<int>? siblingIndices = null)
         {
             if (path.Count == 0) return null;
             // Try as-is.
-            var direct = TryGetParent(img, path);
+            var direct = TryGetParent(img, path, siblingIndices);
             if (direct != null) return direct;
             // Fallback: strip leading "*.img" file-root segment.
             if (path.Count >= 2 && path[0].EndsWith(".img", StringComparison.OrdinalIgnoreCase))
             {
                 var stripped = new List<string>(path.Count - 1);
                 for (int i = 1; i < path.Count; i++) stripped.Add(path[i]);
-                return TryGetParent(img, stripped);
+                var strippedIndices = siblingIndices == null ? null
+                    : (siblingIndices.Count > 0 ? siblingIndices.Skip(1).ToList() : null);
+                return TryGetParent(img, stripped, strippedIndices);
             }
             return null;
         }
 
-        private static IPropertyContainer? TryGetParent(WzImage img, IReadOnlyList<string> path)
+        private static IPropertyContainer? TryGetParent(WzImage img, IReadOnlyList<string> path, IReadOnlyList<int>? siblingIndices)
         {
             if (path.Count == 1) return img;
             var parentPath = new List<string>(path.Count - 1);
             for (int i = 0; i < path.Count - 1; i++) parentPath.Add(path[i]);
-            var parentNode = img.GetFromPath(string.Join("/", parentPath));
+            var parentIndices = siblingIndices == null ? null
+                : (siblingIndices.Count > 0 ? siblingIndices.Take(siblingIndices.Count - 1).ToList() : null);
+            var parentNode = ResolveByIndex(img, parentPath, parentIndices);
             if (parentNode is IPropertyContainer pc) return pc;
             return null;
+        }
+
+        // Deep-diff shape: the diff can add a leaf whose ancestor containers only appear as
+        // context lines (e.g. a whole <imgdir> block re-added, where only the innermost leaf
+        // is a '+' line). Such a bare leaf ADD reaches here with its parent chain missing.
+        // Walk from the deepest existing ancestor and create each missing intermediate as an
+        // empty WzSubProperty, then return the deepest container so the caller can attach the
+        // new node. Creates nothing when the parent chain is entirely present.
+        //
+        // The path may carry a leading file-root segment ("Say.img") that maps to the img
+        // root, not to a real child. Skip any leading segments that end with ".img" — they
+        // refer to the image itself, never to a property we should create.
+        private static IPropertyContainer EnsureParentChain(WzImage img, IReadOnlyList<string> path)
+        {
+            if (path.Count == 0) return img;
+
+            // skip the leading "*.img" root segment(s) — they name the image, not a child
+            int start = 0;
+            while (start < path.Count - 1 && path[start].EndsWith(".img", StringComparison.OrdinalIgnoreCase))
+                start++;
+
+            // find deepest existing container along the parent path (path[start..^1))
+            IPropertyContainer cur = img;
+            int matched = start;
+            while (matched < path.Count - 1)
+            {
+                string seg = path[matched];
+                var child = cur[seg];
+                if (child is IPropertyContainer pc) { cur = pc; matched++; }
+                else break;
+            }
+
+            // create missing intermediates
+            for (int i = matched; i < path.Count - 1; i++)
+            {
+                var sub = new WzSubProperty(path[i]);
+                AddToContainer(cur, sub);
+                cur = sub;
+            }
+            return cur;
+        }
+
+        // WzImage is not an IPropertyContainer; route AddProperty through a small helper so
+        // both callers (existing Add / new EnsureParentChain) treat the image root uniformly.
+        private static void AddToContainer(IPropertyContainer container, WzImageProperty prop)
+        {
+            if (container is WzImage img) img.AddProperty(prop);
+            else container.AddProperty(prop);
         }
 
         // -------- mutate helpers --------
 
         public void ApplyModify(WzImage img, Change c)
         {
-            var node = GetByPath(img, c.Path)
+            var node = GetByPath(img, c.Path, c.SiblingIndices)
                 ?? throw new InvalidOperationException($"node not found: {c.PathString}");
 
             switch (c.ValueType)
@@ -141,17 +237,18 @@ namespace MapleLib.XmlImgPatcher.Patcher
             if (c.SubTree == null)
                 throw new InvalidOperationException($"ADD requires SubTree at {c.PathString}");
 
-            var parent = GetParent(img, c.Path)
-                ?? throw new InvalidOperationException($"parent not found for {c.PathString}");
+            var parent = GetParent(img, c.Path, c.SiblingIndices)
+                ?? EnsureParentChain(img, c.Path);
 
             string newName = c.Path[c.Path.Count - 1];
-            var existing = parent[newName];
+            int newOrdinal = c.SiblingIndexAt(c.Path.Count - 1);
+            var existing = ChildByName(parent, newName, newOrdinal);
 
             if (existing == null)
             {
                 // Simple ADD: node does not exist yet.
                 WzImageProperty newProp = BuildProperty(c.SubTree, overrideName: newName);
-                parent.AddProperty(newProp);
+                AddToContainer(parent, newProp);
                 return;
             }
 
@@ -175,9 +272,10 @@ namespace MapleLib.XmlImgPatcher.Patcher
 
             // Leaf-on-leaf (or any other shape mismatch): remove the existing property and
             // add the diff's version. Same idempotent semantics as MODIFY.
-            parent.RemoveProperty(existing);
+            if (parent is WzImage root) root.RemoveProperty(existing);
+            else parent.RemoveProperty(existing);
             WzImageProperty replacement = BuildProperty(c.SubTree, overrideName: newName);
-            parent.AddProperty(replacement);
+            AddToContainer(parent, replacement);
             img.Changed = true;
         }
 
@@ -189,12 +287,14 @@ namespace MapleLib.XmlImgPatcher.Patcher
             // by the time we hit "QuestInfo.img/8034/name" the parent "8034" was already deleted
             // by the change for "QuestInfo.img/8034". Treat both shapes the same: the post-state
             // matches what the diff asks for.
-            var parent = GetParent(img, c.Path);
+            var parent = GetParent(img, c.Path, c.SiblingIndices);
             if (parent == null) return;
             string targetName = c.Path[c.Path.Count - 1];
-            var existing = parent[targetName];
+            int targetOrdinal = c.SiblingIndexAt(c.Path.Count - 1);
+            var existing = ChildByName(parent, targetName, targetOrdinal);
             if (existing == null) return;
-            parent.RemoveProperty(existing);
+            if (parent is WzImage root) root.RemoveProperty(existing);
+            else parent.RemoveProperty(existing);
         }
 
         // -------- builders --------

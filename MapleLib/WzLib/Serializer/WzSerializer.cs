@@ -116,13 +116,21 @@ namespace MapleLib.WzLib.Serializer
             else if (prop is WzSubProperty)
             {
                 WzSubProperty property9 = (WzSubProperty)prop;
-                tw.Write(depth + "<imgdir name=\"" + XmlUtil.SanitizeText(property9.Name) + "\">" + lineBreak);
-                string newDepth = depth + indent;
-                foreach (WzImageProperty property in property9.WzProperties)
+                if (property9.WzProperties.Count == 0)
                 {
-                    WritePropertyToXML(tw, newDepth, property, exportFilePath);
+                    // Empty container → self-closing (matches the Java side's dump format).
+                    tw.Write(depth + "<imgdir name=\"" + XmlUtil.SanitizeText(property9.Name) + "\"/>" + lineBreak);
                 }
-                tw.Write(depth + "</imgdir>" + lineBreak);
+                else
+                {
+                    tw.Write(depth + "<imgdir name=\"" + XmlUtil.SanitizeText(property9.Name) + "\">" + lineBreak);
+                    string newDepth = depth + indent;
+                    foreach (WzImageProperty property in property9.WzProperties)
+                    {
+                        WritePropertyToXML(tw, newDepth, property, exportFilePath);
+                    }
+                    tw.Write(depth + "</imgdir>" + lineBreak);
+                }
             }
             else if (prop is WzShortProperty)
             {

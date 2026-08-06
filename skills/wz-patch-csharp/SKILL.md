@@ -28,6 +28,7 @@ $EXE batch          <img目录>    <diff目录>   <输出目录>      [选项]
 $EXE batch-dump-xml <img目录>    <xml输出目录>                [选项]
 $EXE verify         <patched.img> <diff>      [full-xml或目录][选项]
 $EXE export         --from=<hash或datetime>                  [选项]
+$EXE sync           --client=<客户端根> --out=<输出根>        [选项]
 ```
 
 | 子命令 | 干啥 |
@@ -38,6 +39,32 @@ $EXE export         --from=<hash或datetime>                  [选项]
 | `batch-dump-xml` | 批量 dump-xml |
 | `verify` | 加载 patched .img，把 diff 里每条 `+` 变更跟运行时节点值逐字段比对。**最权威的校验** |
 | `export` | 从 git 仓库导出服务端补丁 xml + diff，等价于 ExportPatch.java |
+| `sync` | **直接节点级三方对比**（服务端 old/new + 客户端 img），产出 Change 打补丁，**不走文本 diff**。三种来源：服务端 XML 目录、git ref、git 增量 |
+
+### sync 子命令详解
+
+**核心：砍掉文本 diff 中间环节。** 直接做节点级三方对比（服务端 old/new + 客户端 img），产出 Change 列表喂给 patcher，无需生成 unified diff、无需 `--full-xml` 路径反查。路径直接来自对比树，从根本上消除"Python make_diff 和内核 DiffParser 两套 diff 语义对不上"的错位 bug（如 Say.img 29400 的 miss）。
+
+```bash
+# 方式 A：git 增量（--from 起点 → HEAD 的变更，带 DELETE 意图）
+$EXE sync --repo=<git根> --from=<hash或datetime> \
+  --client=<客户端根> --out=<输出根> [--prefix] [--iv] [--strict] [--mode=review|trust] [--dry-run]
+
+# 方式 B：服务端 XML 目录全量匹配（完全不需要 git）
+$EXE sync --server=<xml目录> --client=<客户端根> --out=<输出根> [--iv] [--strict] [--dry-run]
+
+# 方式 C：git 某 ref 全量匹配（不需要 from 基线）
+$EXE sync --repo=<git根> --ref=<commit/tag> --client=<客户端根> --out=<输出根> [--prefix] ...
+```
+
+- **`--from` 复用 export 的 ref/datetime 双解析**；给 `--from` → 增量（显式 DELETE 服务端删的节点）；不给 → 两方全量匹配（默认只 ADD+MODIFY，`--strict` 才删 client 独有业务节点）。
+- **层→客户端映射**：`wz-zh-CN`→`Data/`，`wz`→`EN/`（EN 不存在 fallback `Data/`），同 img 多层映射时 zh 优先。
+- **`--mode=review|trust`**（默认 review）：值差异标记语义。review 把 third-default（client 既非 old 也非 new）列进人工复核清单；trust 静默对齐。
+- **`--in-place`**：直接写客户端（默认写 `--out`，安全模式）。
+- **退出码**：0=成功（含仅 review 项）；1=有 fail；2/3/4/5=参数/解析/img 错误。
+- **输出**：`SYNC SUMMARY` 汇总 ok/nochange/fail/review + 人工复核清单（third-default / type-conflict / missing-unmodified）。
+- **同名兄弟处理**：Change 携带每段 sibling index，patch 时精确 resolve 到同名兄弟中的特定一个（如 Say.img 两个 8072 只改/删正确的那个）。
+- **行为规则**（与 Java 版一致）：`client==old` → auto 静默；client 既非 old 也非 new → third-default 进 review；`old==new` 但 `client≠new` → 进 review；client 缺失 + `old==new` → missing-unmodified 进 review（不自动补）；client 缺失 + 服务端有改 → ADD；canvas/sound/uol 二进制永远保留。
 
 ### export 子命令详解
 
@@ -72,16 +99,23 @@ $EXE export \
 | `-V, --version` | 全部 | 打印版本号 |
 | `--iv=<KEY>` | 全部 | WZ 加密 IV，大小写不敏感。可用 `gms / ems / bms / cms / classic / latest`，默认 `gms` |
 | `-v, --verbose` | 全部 | 失败时打印完整堆栈 |
-| `--dry-run` | patch, batch | 只解析+模拟，不写文件 |
-| `--strict` | patch, batch | 任一变更失败立即中止（默认尽力跑完后汇总） |
+| `--dry-run` | patch, batch, sync | 只解析+模拟，不写文件 |
+| `--strict` | patch, batch, sync | patch/batch：任一变更失败立即中止；sync：两方全量下 client 独有业务节点也 DELETE |
 | `--full-xml=<文件>` | patch | 单个完整服务端 XML |
 | `--full-xml-dir=<目录>` | patch, batch | 完整服务端 XML 根目录，按目录结构自动配对 |
 | `--linux` | dump-xml, batch-dump-xml | 输出用 LF 行尾（默认 CRLF） |
-| `--from=<hash或datetime>` | export | 起点（必填） |
-| `--repo=<dir>` | export | git 仓库根（默认当前目录） |
+| `--from=<hash或datetime>` | export, sync | 起点（export 必填；sync 增量模式） |
+| `--repo=<dir>` | export, sync | git 仓库根（默认当前目录） |
+| `--ref=<ref>` | sync | git ref/tag/branch（sync 全量模式） |
+| `--server=<dir>` | sync | 服务端 XML 目录（sync 全量匹配，不需要 git） |
+| `--client=<dir>` | sync | 客户端根目录（必填） |
+| `--out=<dir>` | sync | 输出根（--in-place 时可省） |
+| `--in-place` | sync | 直接写客户端（默认写 --out） |
+| `--mode=review\|trust` | sync | 值差异标记语义（默认 review） |
+| `--review-out=<file>` | sync | 把人工复核清单写到文件（每行一条） |
 | `--out-xml=<dir>` | export | xml 输出根（默认 ~/Desktop/upgrade_yyyyMMdd） |
 | `--out-diff=<dir>` | export | diff 输出根（默认 ~/Desktop/diff_yyyyMMdd） |
-| `--prefix=<pref>` | export | 扫描目录前缀（可多个，默认 gms-server/wz,wz-zh-CN） |
+| `--prefix=<pref>` | export, sync | 扫描目录前缀（可多个，默认 gms-server/wz,wz-zh-CN） |
 | `--no-diff` | export | 只复制 xml，不生成 diff |
 | `--context=<N>` | export | git diff 上下文行数 -U（默认 30） |
 
@@ -213,10 +247,12 @@ $EXE verify "C:\out\Data\Quest\Say.img" \
 2. **要改一个 .img** → `patch`，带上 `--full-xml` 或 `--full-xml-dir`
 3. **要改一整个目录** → `batch`，带 `--full-xml-dir`
 4. **完整工作流（从服务端到客户端）** → `export` → `batch` → `verify`（见上方一站式示例）
-5. **不确定能不能成** → 先 `--dry-run`
-6. **改完要确认对不对** → `verify`（比肉眼看 dump-xml 可靠）
-7. **只想看 .img 里有什么** → `dump-xml`
-8. **img 解析失败（退出 4）** → 99% 是 `--iv` 给错了，默认 `gms` 对应 GMS v83 客户端
+5. **服务端不生成 diff / 想直接全量对齐客户端** → `sync --server=<xml目录>` 或 `--repo+--ref`（两方全量）
+6. **想按服务端 git 增量同步（带 DELETE 意图 + 复核清单）** → `sync --repo --from=<ref|datetime>`（三方）
+7. **不确定能不能成** → 先 `--dry-run`
+8. **改完要确认对不对** → `verify`（比肉眼看 dump-xml 可靠）
+9. **只想看 .img 里有什么** → `dump-xml`
+10. **img 解析失败（退出 4）** → 99% 是 `--iv` 给错了，默认 `gms` 对应 GMS v83 客户端
 
 ## 已知限制
 
@@ -224,3 +260,4 @@ $EXE verify "C:\out\Data\Quest\Say.img" \
 - 不解析 diff 文件头里的路径，多文件 diff 要拆开传
 - `--strict` 失败不回滚已应用的修改；用 `--dry-run` 先校验
 - 短 hunk（深嵌套小改动）必须配 `--full-xml` / `--full-xml-dir` 才能正确推路径
+- ADD 支持多级父链：直接父缺失时递归建中间容器再挂叶子/子树（2026-08-06 修复，之前会报"父节点不存在"）
