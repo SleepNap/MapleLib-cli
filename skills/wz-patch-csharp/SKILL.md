@@ -28,6 +28,7 @@ $EXE batch          <img目录>    <diff目录>   <输出目录>      [选项]
 $EXE batch-dump-xml <img目录>    <xml输出目录>                [选项]
 $EXE verify         <patched.img> <diff>      [full-xml或目录][选项]
 $EXE export         --from=<hash或datetime>                  [选项]
+$EXE dump-changes   <diff>        [--full-xml=<path>] [选项]
 $EXE sync           --client=<客户端根> --out=<输出根>        [选项]
 ```
 
@@ -39,6 +40,7 @@ $EXE sync           --client=<客户端根> --out=<输出根>        [选项]
 | `batch-dump-xml` | 批量 dump-xml |
 | `verify` | 加载 patched .img，把 diff 里每条 `+` 变更跟运行时节点值逐字段比对。**最权威的校验** |
 | `export` | 从 git 仓库导出服务端补丁 xml + diff，等价于 ExportPatch.java |
+| `dump-changes` | 调试用：打印 DiffParser 解析 diff 后得到的所有 Change（op / path / value / 源行号），不写文件。**C# 特有**，Java 版无此子命令 |
 | `sync` | **直接节点级三方对比**（服务端 old/new + 客户端 img），产出 Change 打补丁，**不走文本 diff**。三种来源：服务端 XML 目录、git ref、git 增量 |
 
 ### sync 子命令详解
@@ -104,6 +106,7 @@ $EXE export \
 | `--full-xml=<文件>` | patch | 单个完整服务端 XML |
 | `--full-xml-dir=<目录>` | patch, batch | 完整服务端 XML 根目录，按目录结构自动配对 |
 | `--linux` | dump-xml, batch-dump-xml | 输出用 LF 行尾（默认 CRLF） |
+| `--indent=<N>` | dump-xml, batch-dump-xml | 缩进空格数，默认 4（与 Java 版一致） |
 | `--from=<hash或datetime>` | export, sync | 起点（export 必填；sync 增量模式） |
 | `--repo=<dir>` | export, sync | git 仓库根（默认当前目录） |
 | `--ref=<ref>` | sync | git ref/tag/branch（sync 全量模式） |

@@ -60,6 +60,7 @@ xml-img-patcher sync           --client=<客户端根> --out=<输出根> [选项
 |---|---|
 | `--iv <GMS\|EMS\|BMS\|CLASSIC>` | 同上 |
 | `--linux` | 用 LF 行尾（默认 CRLF） |
+| `--indent <N>` | 缩进空格数（默认 4，与 Java 版一致） |
 
 默认会**跳过 PNG / Sound 等二进制资源**（只输出节点骨架），便于纯文本对比。
 
@@ -260,4 +261,4 @@ dotnet publish MapleLib.XmlImgPatcher/MapleLib.XmlImgPatcher.csproj -c Release
 | C# | <https://github.com/SleepNap/MapleLib-cli> | `dist/xml-img-patcher.exe`（.NET AOT/publish 单文件） |
 | Java | <https://github.com/SleepNap/orange-wz-cli> | `dist/xml-img-patcher.exe`（GraalVM native，standalone） |
 
-两边功能、子命令、选项、退出码、输出格式**完全一致**，脚本可互换。两边 `dump-xml --linux` 输出逐字节一致。
+两边功能、子命令、选项、退出码、输出格式**完全一致**，脚本可互换。两边 `dump-xml --linux` 非 canvas 部分逐字节一致；canvas 节点 C# 输出 `width/height` 真实尺寸，Java 输出 `format/scale`（Java 侧待修，见姊妹仓库 issue）。
