@@ -38,6 +38,7 @@ namespace MapleLib.XmlImgPatcher
 
             var positional = new List<string>();
             bool verbose = false, dryRun = false, strict = false, linuxLineBreak = false;
+            int indent = 4; // dump-xml 缩进空格数（与 Java 版默认 4 对齐）
             WzMapleVersion version = WzMapleVersion.GMS;
             string? fullXml = null;
             string? fullXmlDir = null;
@@ -67,6 +68,14 @@ namespace MapleLib.XmlImgPatcher
                 else if (a == "--dry-run") dryRun = true;
                 else if (a == "--strict") strict = true;
                 else if (a == "--linux") linuxLineBreak = true;
+                else if (a.StartsWith("--indent=", StringComparison.Ordinal))
+                {
+                    if (!int.TryParse(a.Substring("--indent=".Length), out indent) || indent <= 0)
+                    {
+                        Console.Error.WriteLine($"invalid --indent value, must be positive integer");
+                        return 2;
+                    }
+                }
                 else if (a == "--no-diff") exportNoDiff = true;
                 else if (a.StartsWith("--full-xml=", StringComparison.Ordinal))
                 {
@@ -159,9 +168,9 @@ namespace MapleLib.XmlImgPatcher
 
             return mode switch
             {
-                "dump-xml" => RunDumpXml(positional, version, verbose, linuxLineBreak),
+                "dump-xml" => RunDumpXml(positional, version, verbose, linuxLineBreak, indent),
                 "batch" => RunBatch(positional, version, verbose, dryRun, strict, fullXmlDir),
-                "batch-dump-xml" => RunBatchDumpXml(positional, version, verbose, linuxLineBreak),
+                "batch-dump-xml" => RunBatchDumpXml(positional, version, verbose, linuxLineBreak, indent),
                 "verify" => RunVerify(positional, version, verbose, fullXmlDir),
                 "dump-changes" => RunDumpChanges(positional, fullXml),
                 "export" => RunExport(exportFrom, exportRepo, exportOutXml, exportOutDiff, exportPrefixes, exportNoDiff, exportContext, verbose),
@@ -254,7 +263,7 @@ namespace MapleLib.XmlImgPatcher
         }
 
         // ---------- dump-xml ----------
-        private static int RunDumpXml(List<string> positional, WzMapleVersion version, bool verbose, bool linuxLineBreak)
+        private static int RunDumpXml(List<string> positional, WzMapleVersion version, bool verbose, bool linuxLineBreak, int indent)
         {
             if (positional.Count != 2)
             {
@@ -264,10 +273,10 @@ namespace MapleLib.XmlImgPatcher
             string inputImg = positional[0];
             string outputXml = positional[1];
             if (!File.Exists(inputImg)) { Console.Error.WriteLine($"input not found: {inputImg}"); return 2; }
-            return DumpOne(inputImg, outputXml, version, verbose, linuxLineBreak);
+            return DumpOne(inputImg, outputXml, version, verbose, linuxLineBreak, indent);
         }
 
-        private static int DumpOne(string inputImg, string outputXml, WzMapleVersion version, bool verbose, bool linuxLineBreak)
+        private static int DumpOne(string inputImg, string outputXml, WzMapleVersion version, bool verbose, bool linuxLineBreak, int indent)
         {
             try
             {
@@ -280,7 +289,7 @@ namespace MapleLib.XmlImgPatcher
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
                 var lineBreak = linuxLineBreak ? LineBreak.Unix : LineBreak.Windows;
-                var ser = new WzClassicXmlSerializer(indentation: 2, lineBreakType: lineBreak, exportbase64: false);
+                var ser = new WzClassicXmlSerializer(indentation: indent, lineBreakType: lineBreak, exportbase64: false);
                 ser.SerializeImage(img, outputXml);
                 Console.Out.WriteLine($"[ok] dump-xml {inputImg} -> {outputXml}");
                 return 0;
@@ -1010,7 +1019,7 @@ namespace MapleLib.XmlImgPatcher
         }
 
         // ---------- batch-dump-xml ----------
-        private static int RunBatchDumpXml(List<string> positional, WzMapleVersion version, bool verbose, bool linuxLineBreak)
+        private static int RunBatchDumpXml(List<string> positional, WzMapleVersion version, bool verbose, bool linuxLineBreak, int indent)
         {
             if (positional.Count != 2)
             {
@@ -1029,7 +1038,7 @@ namespace MapleLib.XmlImgPatcher
             {
                 string rel = Path.GetRelativePath(imgDir, img);
                 string outXml = Path.Combine(outDir, rel + ".xml");
-                int rc = DumpOne(img, outXml, version, verbose, linuxLineBreak);
+                int rc = DumpOne(img, outXml, version, verbose, linuxLineBreak, indent);
                 if (rc == 0) ok++; else fail++;
             }
             Console.Out.WriteLine();
@@ -1566,6 +1575,7 @@ namespace MapleLib.XmlImgPatcher
             w.WriteLine("      --full-xml-dir=<目录>  跟 --full-xml 同样作用，但是按 batch 的目录");
             w.WriteLine("                         结构去配对。建议批量跑时都加上。（仅 batch 用）");
             w.WriteLine("      --linux             dump-xml / batch-dump-xml 输出用 LF 行尾（默认 CRLF）");
+            w.WriteLine("      --indent=<N>        dump-xml / batch-dump-xml 缩进空格数，默认 4（与 Java 版一致）");
             w.WriteLine();
             w.WriteLine("export 专用选项：");
             w.WriteLine("      --from=<起点>      必填。git commit hash / ref（如 27529d68 / HEAD~3），");
