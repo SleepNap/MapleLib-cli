@@ -1,6 +1,6 @@
 # xml-img-patcher 待办（交接给下一个 AI）
 
-> 当前状态（commit `f05b68e`）：C# 版 CLI 31/31 verify 通过（含 DELETE 校验 + SubTree 递归展开）。Say.img 4928/1 DiffParser bug 已修复，与 Java 版输出 size 一致。
+> 当前状态（commit `f05b68e` + 未提交的 0.5 修复）：C# 版 CLI 31/31 verify 通过（含 DELETE 校验 + SubTree 递归展开）。Say.img 4928/1 DiffParser bug 已修复，与 Java 版输出 size 一致。Say.img 8072/28344 兄弟重排假删除 bug 已修复（见 0.5），全量 154 diff 零回归。
 
 ## 0. ~~已知未修复 bug：DiffParser plus block 内 sibling 容器丢失（Say.img 4928/1）~~ ✅ 已修复
 
@@ -16,6 +16,26 @@
 - 31/31 patch + verify 全过
 - Say.img 与 Java 版 size 一致（2354183 字节），4928/1 子树正确归位
 - md5 仍与 Java 不同（MapleLib 序列化顺序差异），但节点数据正确
+
+---
+
+## 0.5 ~~已知 bug：兄弟重排 imgdir 的假 DELETE 丢节点（Say.img 8072/28344 等）~~ ✅ 已修复
+
+**修复**：本次改动（未提交），改 `MapleLib.XmlImgPatcher/Patcher/ImgPatcher.cs`
+
+**现象**：Say.img 丢 8 个中文节点（8072 的 `yes/0`、`no/0`、`1/0`、`stop/npc/0`；28344 的 `0/0`、`no/0`、`1/0`、`stop/item/0`），全部名为 "0" 的对话叶子。
+
+**根因**：git diff 把兄弟位置重排的 imgdir 表示成「旧位置整棵 DELETE（block B）+ 新位置 context/modify（block A）」两个 hunk。DiffParser 忠实地把两部分都转成 Change，Patcher 按 Delete->Modify->Add 相位执行：先 DELETE 整棵 8072（block B），随后 block A 里单条 `-`/`+` 对合并成的 MODIFY（`yes/0` 等）找不到节点失败（`[err] node not found`），只剩 6 个 ADD（`0/0..5`，来自连续 6-minus/6-plus 块）补回。`yes/0` 等永久丢失。现有 `CancelFalseRenames` 只处理「空 ADD 配 DELETE」，没覆盖这种「容器被 DELETE 但子孙同时被 MODIFY/ADD」的假删除。
+
+**修法**：在 `ImgPatcher.Patch` 里 `CancelFalseRenames` 之后新增 `CancelReorderDeletes` 过滤 pass：
+- 构建 `retained` = 所有 ADD/MODIFY 目标路径 ∪ 它们的全部祖先路径
+- 取消任何 `PathString ∈ retained` 的 DELETE
+- 理由：WZ imgdir 按名键索引，兄弟重排是 no-op；被 DELETE 的节点若同时被 MODIFY/ADD（自身或子孙），它只是移动而非真删除，DELETE 是 git diff 伪影。真删除子树整棵都是 `-`，其下不会有 MODIFY/ADD，故不会被误取消。
+
+**验证**（隔离目录 `C:\Users\CN\Desktop\fix-val-8072`，从 BeiDou-Server `27529d68..HEAD` 重新 export）：
+- Say.img：OLD exe `1113 expected, 1105 match, 8 miss` + 9 failed → NEW exe `1113 expected, 1113 match, 0 miss` + 0 failed
+- Act.img / Check.img（同样有假重排，原测试未验证）：NEW exe 两层流程均 0 miss
+- 全量 154 diff 回归：wz 层 NEW=OLD=48 ok 0 fail；wz-zh-CN 层 OLD 105 ok 1 fail(Say.img) → NEW 106 ok 0 fail。零回归。
 
 ---
 

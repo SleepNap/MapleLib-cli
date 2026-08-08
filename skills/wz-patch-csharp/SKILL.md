@@ -264,3 +264,4 @@ $EXE verify "C:\out\Data\Quest\Say.img" \
 - `--strict` 失败不回滚已应用的修改；用 `--dry-run` 先校验
 - 短 hunk（深嵌套小改动）必须配 `--full-xml` / `--full-xml-dir` 才能正确推路径
 - ADD 支持多级父链：直接父缺失时递归建中间容器再挂叶子/子树（2026-08-06 修复，之前会报"父节点不存在"）
+- 兄弟位置重排的 imgdir 会被识别为「假删除」并取消 DELETE：git diff 把重排表示成「旧位置整棵 DELETE + 新位置 context/modify」两个 hunk，若照搬会先删后改导致 `MODIFY ... node not found` 丢节点（如 Say.img 8072/28344）。`CancelReorderDeletes` 会取消那些同时被 MODIFY/ADD（自身或子孙）覆盖的 DELETE（2026-08-08 修复）

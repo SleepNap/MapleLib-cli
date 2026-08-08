@@ -60,6 +60,7 @@ namespace MapleLib.XmlImgPatcher.Patcher
             // the DELETE would drop X's children, then the empty ADD would re-add X as an empty
             // container, losing data. Cancel both so the original subtree is preserved.
             changes = CancelFalseRenames(changes);
+            changes = CancelReorderDeletes(changes);
 
             var ordered = new List<Change>(changes.Count);
             ordered.AddRange(changes.Where(c => c.Op == ChangeOp.Delete));
@@ -194,6 +195,48 @@ namespace MapleLib.XmlImgPatcher.Patcher
                 final.Add(c);
             }
             return final;
+        }
+
+        // Cancel DELETEs of nodes the diff simultaneously keeps via a MODIFY or ADD at the same
+        // path or inside it. git diff represents an imgdir that changes sibling position as
+        // DELETE-from-old-position + context/modify-at-new-position. The DELETE is spurious -
+        // WZ imgdirs are name-keyed, so reordering is a no-op - but applying it (phased
+        // Delete-first) wipes the subtree before the MODIFY/ADD that updates it can run, losing
+        // nodes. Concretely: Say.img/8072/0/yes/0 got both a DELETE (block B wipes the whole
+        // 8072 subtree) and a MODIFY (block A updates the value); the DELETE won the phase race,
+        // MODIFY failed with "node not found", and the leaf was lost.
+        //
+        // A real removal never has MODIFY/ADD under the deleted path (the whole subtree is '-'),
+        // so only the false-reorder case is cancelled. Exact-path match covers leaf DELETEs that
+        // share a path with a MODIFY/ADD (a value change split into DELETE+ADD); ancestor match
+        // covers the container DELETEs in the same false-rename block (DELETE 8072/0/yes vs
+        // MODIFY 8072/0/yes/0).
+        private static IReadOnlyList<Change> CancelReorderDeletes(IReadOnlyList<Change> changes)
+        {
+            var retained = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var c in changes)
+            {
+                if (c.Op != ChangeOp.Add && c.Op != ChangeOp.Modify) continue;
+                retained.Add(c.PathString);
+                // All ancestor paths so a DELETE of an enclosing container is also cancelled.
+                string acc = "";
+                for (int i = 0; i < c.Path.Count - 1; i++)
+                {
+                    acc = i == 0 ? c.Path[i] : acc + "/" + c.Path[i];
+                    retained.Add(acc);
+                }
+            }
+
+            if (retained.Count == 0) return changes;
+
+            var result = new List<Change>(changes.Count);
+            foreach (var c in changes)
+            {
+                if (c.Op == ChangeOp.Delete && retained.Contains(c.PathString))
+                    continue; // false reorder DELETE - the MODIFY/ADD at/under it will update it
+                result.Add(c);
+            }
+            return result;
         }
     }
 }
