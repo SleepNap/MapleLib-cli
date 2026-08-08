@@ -237,6 +237,15 @@ xml-img-patcher sync --repo=E:/LocalGit/GitHub/BeiDou-Server --ref=HEAD \
 
 末尾打印 `SYNC SUMMARY`（ok/nochange/fail/review）+ 人工复核清单（third-default / type-conflict / missing-unmodified）。
 
+## 下载
+
+GitHub Releases 提供编译好的单文件 exe，目标机**无需安装 .NET 运行时**：
+
+- 最新版下载页：<https://github.com/SleepNap/MapleLib-cli/releases/latest>
+- 直接拉 exe：<https://github.com/SleepNap/MapleLib-cli/releases/latest/download/xml-img-patcher.exe>（约 80 MB，self-contained）
+
+需要改代码或调试见下方「构建」。
+
 ## 构建
 
 要求 .NET 10.0+：
@@ -253,6 +262,10 @@ dotnet publish MapleLib.XmlImgPatcher/MapleLib.XmlImgPatcher.csproj -c Release
 ```
 
 项目根 `publish.bat` 是封装好的一键构建，产出复制到 `dist/xml-img-patcher.exe`。
+
+## 更新记录
+
+- **v2**（2026-08-08）：修复 Say.img 8072/28344 等兄弟重排 imgdir 的假 DELETE 导致丢 8 个中文节点的问题（新增 `CancelReorderDeletes` pass，详见 `TODO.md` 0.5 节）。全量 154 diff 零回归。
 
 ## 姊妹仓库
 
